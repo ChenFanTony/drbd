@@ -1,0 +1,399 @@
+# Day 4 — The Write Request Path: `__drbd_make_request()` to `bio_endio()`
+
+> **Estimated study time: 3–4 hours**
+> **Primary files:** `drbd/drbd_req.c`, `drbd/drbd_req.h`, `drbd/drbd_main.c`
+
+---
+
+## 1. The Entry Point
+
+Every block I/O submitted to `/dev/drbdN` enters DRBD via the `submit_bio` callback set in `drbd_ops` (Day 1). The entry chain is:
+
+```bash
+grep -n "drbd_submit_bio\b\|__drbd_make_request\b" drbd/drbd_req.c drbd/drbd_main.c | head -10
+```
+
+```c
+// drbd/drbd_req.c
+void drbd_submit_bio(struct bio *bio);
+    // → minimal wrapper, eventually calls:
+void __drbd_make_request(struct drbd_device *device,
+                          struct bio *bio,
+                          ktime_t start_kt,
+                          unsigned long start_jif);
+    // ← this is where the real work happens
+```
+
+The `struct bio` carries:
+- `bio->bi_iter.bi_sector` — starting sector (512-byte units)
+- `bio->bi_iter.bi_size`   — byte count
+- `bio->bi_opf`            — operation flags (REQ_OP_WRITE, REQ_OP_READ, REQ_FUA, REQ_PREFLUSH…)
+- `bio->bi_io_vec[]`       — scatter-gather list of data pages
+
+> **Note:** Older DRBD versions used `__drbd_make_request()` registered via `blk_queue_make_request()`. In DRBD 9.2 + modern kernels, the block layer calls `.submit_bio` directly. Throughout this day, when you see `__drbd_make_request()` in older docs/code, mentally substitute `__drbd_make_request()`.
+
+---
+
+## 2. `struct drbd_request` — The Core Object
+
+```bash
+grep -n "struct drbd_request {" drbd/drbd_req.h
+# Read every field
+```
+
+```c
+struct drbd_request {
+    struct drbd_device *device;        // which volume
+    struct drbd_interval i;            // sector + size (for interval tree)
+                                       // i.sector, i.size, i.local, i.completed
+    struct bio *master_bio;            // the original bio from the application
+    struct bio *private_bio;           // cloned bio submitted to local disk
+    //                                 // NULL if device is diskless
+
+    spinlock_t rq_lock;                // ← per-request lock (in addition to req_lock)
+    unsigned int local_rq_state;       // ← LOCAL I/O state bits (single u32)
+    u16 net_rq_state[DRBD_NODE_ID_MAX];// ← per-peer network state (one slot per node)
+
+    // ── Note: the actual struct in DRBD 9.2 splits state across these fields,
+    //         NOT a single rq_state[1+DRBD_PEERS_MAX] array.
+
+    u64 dagtag_sector;                 // Data Generation Tag — global write sequence
+                                       // used to enforce ordering on secondaries
+
+    struct list_head tl_requests;      // node in resource->transfer_log
+    struct list_head req_pending_master_completion;
+    struct list_head req_pending_local; // waiting for local disk ack
+
+    unsigned int epoch;                // which write epoch this belongs to
+
+    atomic_t completion_ref;           // when 0: master_bio may be completed
+    struct kref kref;                  // when 0: drbd_request may be freed
+
+    // timestamps for latency tracking
+    ktime_t start_kt;
+    unsigned long start_jif;
+    unsigned long pre_submit_jif;
+    unsigned long in_actlog_jif;
+};
+```
+```
+
+---
+
+## 3. State Bits — Every Bit Explained
+
+```bash
+grep -n "RQ_LOCAL_PENDING\|RQ_NET_PENDING\|RQ_NET_SENT\|RQ_NET_OK\|RQ_LOCAL_OK\|RQ_WRITE\|RQ_COMPLETION_SUSP\|RQ_EXP_BARR_ACK\|RQ_EXP_WRITE_ACK\|RQ_EXP_RECEIVE_ACK" \
+    drbd/drbd_req.h
+```
+
+State bits split across two fields:
+
+**`local_rq_state` bits (one per request):**
+
+| Bit | Meaning |
+|---|---|
+| `RQ_LOCAL_PENDING` | Local disk write submitted, not yet completed |
+| `RQ_LOCAL_OK` | Local disk write completed successfully |
+| `RQ_LOCAL_ABORTED` | Local disk write failed |
+| `RQ_LOCAL_COMPLETED` | Local I/O processing finished (OK or aborted) |
+| `RQ_WRITE` | This is a write request (not a read) |
+| `RQ_IN_ACT_LOG` | This request has reserved an activity log slot |
+| `RQ_POSTPONED` | Postponed for any reason (overlap, suspended I/O) |
+| `RQ_COMPLETION_SUSP` | Completion is suspended (fencing active) |
+| `RQ_UNPLUG` | This request triggers a queue unplug |
+
+**`net_rq_state[node_id]` bits (one set per peer):**
+
+| Bit | Meaning |
+|---|---|
+| `RQ_NET_PENDING` | Waiting for network acknowledgement from this peer |
+| `RQ_NET_SENT` | Data sent over network (at least into TCP buffer) |
+| `RQ_NET_OK` | Peer confirmed the write (protocol C: written to peer disk) |
+| `RQ_NET_DONE` | Network processing complete (either OK or failed) |
+| `RQ_EXP_WRITE_ACK` | Expecting P_WRITE_ACK (protocol C) |
+| `RQ_EXP_RECEIVE_ACK` | Expecting P_RECV_ACK (protocol B) |
+| `RQ_EXP_BARR_ACK` | Waiting for barrier acknowledgement |
+
+**The rule:** The master bio is completed (and `bio_endio()` called) only when `req->completion_ref` drops to zero. That refcount is decremented by both local completion and per-peer ACK paths.
+
+---
+
+## 4. Full Write Path — Annotated Call Chain
+
+```bash
+grep -n -A 200 "^void __drbd_make_request\b" drbd/drbd_req.c
+```
+
+Step-by-step with exact function calls (note: state-bit notation below uses `local_rq_state` and `net_rq_state[idx]` per Section 3):
+
+```
+drbd_submit_bio(bio)
+  └── __drbd_make_request(device, bio, start_kt, start_jif)
+│
+├─ 1. Sanity checks
+│   ├── if (!get_ldev_if_state(device, D_UP_TO_DATE)) → bio_endio(EIO)
+│   │       // get_ldev_if_state atomically increments device->local_cnt
+│   │       // and verifies disk_state >= required state
+│   └── if (bio_data_dir(bio) == WRITE && !drbd_suspended(device)) ...
+│
+├─ 2. Allocate drbd_request from mempool
+│   └── req = drbd_req_new(device, bio)
+│           → mempool_alloc(&drbd_request_mempool, GFP_NOIO)
+│           → req->master_bio    = bio
+│           → req->device        = device
+│           → req->dagtag_sector = atomic64_inc_return(&resource->dagtag_sector)
+│
+├─ 3. Activity log reservation (if write)
+│   └── drbd_al_begin_io_fastpath(device, &req->i)        ← cache HIT path
+│        OR drbd_al_begin_io_nonblock(device, &req->i)    ← async MISS path
+│           → on miss: queue an AL transaction; the write is parked
+│             until drbd_al_begin_io_commit() runs
+│           → sets RQ_IN_ACT_LOG in local_rq_state on success
+│
+├─ 4. Insert into interval tree (overlap detection)
+│   └── drbd_insert_interval(&device->write_requests, &req->i)
+│           → rb_insert_augmented() in drbd_interval.c
+│
+├─ 5. Insert into transfer log (write ordering)
+│   └── list_add_tail(&req->tl_requests, &resource->transfer_log)
+│           // held under resource->req_lock spinlock
+│
+├─ 6. Determine required acks based on replication protocol
+│   └── for each peer_device in Established state:
+│         net_rq_state[peer_idx] |= RQ_NET_PENDING
+│         if protocol == C: net_rq_state[peer_idx] |= RQ_EXP_WRITE_ACK
+│         if protocol == B: net_rq_state[peer_idx] |= RQ_EXP_RECEIVE_ACK
+│         atomic_inc(&req->completion_ref)   // one ref per pending peer
+│
+├─ 7. Submit to local disk (if device has disk)
+│   ├── req->private_bio = bio_alloc_clone(...)
+│   ├── req->private_bio->bi_end_io = drbd_request_endio
+│   ├── local_rq_state |= RQ_LOCAL_PENDING
+│   ├── atomic_inc(&req->completion_ref)    // ref for local I/O
+│   └── submit_bio_noacct(req->private_bio)
+│
+├─ 8. Enqueue for network send
+│   └── drbd_queue_write(device, req)
+│           // queues the request for the connection's sender thread
+│           // actual send happens in drbd_sender.c (drbd_send_dblock and friends)
+│
+└─ 9. Return
+       // bio is NOT yet complete — completion happens asynchronously
+       // when req->completion_ref drops to 0
+```
+
+---
+
+## 5. Local Completion: `drbd_request_endio()`
+
+Called when the local disk write finishes (interrupt/softirq context → workqueue):
+
+```bash
+grep -n -A 60 "^void drbd_request_endio\b" drbd/drbd_req.c
+```
+
+```c
+void drbd_request_endio(struct bio *bio)
+{
+    struct drbd_request *req = bio->bi_private;
+    struct drbd_device *device = req->device;
+
+    // Was there an I/O error?
+    if (bio->bi_status) {
+        req->private_bio = ERR_PTR(-EIO);
+        __req_mod(req, READ_COMPLETED_WITH_ERROR, ...);  // or WRITE_COMPLETED_WITH_ERROR
+    } else {
+        __req_mod(req, WRITE_COMPLETED_WITH_ERROR == 0, ...);
+        // Actually: calls req_mod() with appropriate completion event
+    }
+}
+```
+
+Then `__req_mod()` clears `RQ_LOCAL_PENDING`, sets `RQ_LOCAL_OK`, and calls `drbd_req_complete()` if all bits are now clear.
+
+---
+
+## 6. `__req_mod()` — The Request State Machine Driver
+
+This is the most important function in `drbd_req.c`. It drives the state machine for each request. **Note:** The actual mechanism in DRBD 9.2 uses `mod_rq_state()` and `req_mod()` together, with completion driven by `req->completion_ref` (an atomic counter) rather than by checking individual bits.
+
+```bash
+grep -n "^void __req_mod\|^void req_mod\|^static void mod_rq_state" drbd/drbd_req.c | head -10
+grep -n -A 100 "^static void mod_rq_state\b" drbd/drbd_req.c
+```
+
+The pattern (simplified):
+
+```c
+void __req_mod(struct drbd_request *req, enum drbd_req_event what,
+               struct drbd_peer_device *peer_device,
+               struct bio_and_error *m)
+{
+    // m is set to {master_bio, error} when completion is triggered
+    switch (what) {
+
+    case WRITE_COMPLETED_WITH_ERROR:
+        // local disk write failed
+        // → mark request failed, possibly detach disk
+        mod_rq_state(req, m, RQ_LOCAL_PENDING, RQ_LOCAL_COMPLETED|RQ_LOCAL_ABORTED);
+        // → atomic_dec(&req->completion_ref)
+
+    case COMPLETED_OK:
+        // local disk write OK
+        mod_rq_state(req, m, RQ_LOCAL_PENDING, RQ_LOCAL_COMPLETED|RQ_LOCAL_OK);
+        if (local_rq_state & RQ_IN_ACT_LOG)
+            drbd_al_complete_io(device, &req->i);
+        atomic_dec(&req->completion_ref);
+        break;
+
+    case WRITE_ACKED_BY_PEER:         // P_WRITE_ACK received
+        net_rq_state[peer_idx] &= ~RQ_NET_PENDING;
+        net_rq_state[peer_idx] |=  RQ_NET_OK | RQ_NET_DONE;
+        atomic_dec(&req->completion_ref);
+        break;
+
+    case RECV_ACKED_BY_PEER:          // P_RECV_ACK received
+        net_rq_state[peer_idx] &= ~RQ_NET_PENDING;
+        net_rq_state[peer_idx] |=  RQ_NET_OK;
+        atomic_dec(&req->completion_ref);
+        break;
+
+    case BARRIER_ACKED:               // P_BARRIER_ACK received
+        // All writes before this barrier are now durable on peer
+        net_rq_state[peer_idx] |= RQ_NET_DONE;
+        break;
+
+    case SEND_CANCELED:               // peer disconnected before send
+        net_rq_state[peer_idx] &= ~RQ_NET_PENDING;
+        net_rq_state[peer_idx] |=  RQ_NET_DONE;
+        atomic_dec(&req->completion_ref);
+        break;
+    }
+
+    // After every state change: check if completion_ref hit zero
+    // If so: drbd_req_complete() → bio_endio() of master_bio
+}
+```
+
+---
+
+## 7. Completion via `req->completion_ref`
+
+In DRBD 9.2, completion is driven by a refcount, not by checking individual bits:
+
+```bash
+grep -n "completion_ref\|drbd_req_complete\|req_destroy_after_send_acks" drbd/drbd_req.c | head -20
+```
+
+The pattern:
+
+```c
+struct drbd_request {
+    ...
+    atomic_t completion_ref;   // when 0: master_bio may be completed
+    struct kref kref;          // when 0: drbd_request itself may be freed
+    ...
+};
+```
+
+Each ref-taking event (initial creation, local I/O submission, per-peer pending) increments `completion_ref`. Each completion event (local endio, P_WRITE_ACK, etc.) decrements it.
+
+When `completion_ref` reaches zero, `drbd_req_complete()` triggers the master bio:
+
+```c
+if (atomic_dec_and_test(&req->completion_ref)) {
+    // All pending work done
+    drbd_remove_interval(&device->write_requests, &req->i);
+    list_del_init(&req->tl_requests);
+    wake_up(&device->misc_wait);
+
+    m->bio   = req->master_bio;
+    m->error = (local_rq_state & RQ_LOCAL_ABORTED) ? -EIO : 0;
+    // The caller (outside the lock) calls bio_endio(m->bio, m->error)
+
+    // Then the kref drops:
+    kref_put(&req->kref, drbd_req_destroy);
+    // (deferred — peer-ack tracking may still hold references)
+}
+```
+
+This ref-based design lets DRBD cleanly handle: local + N peers in protocol C, multiple peer ACK paths, peer ACK forwarding (Day 22), and crash-time cleanup.
+
+---
+
+## 8. The Replication Protocols: When Does `bio_endio()` Fire?
+
+| Protocol | `RQ_LOCAL_PENDING` must clear | `RQ_NET_PENDING` must clear | When? |
+|---|---|---|---|
+| **A** (async) | Yes | Yes, but cleared when data *sent* (not acked) | Very fast; data loss risk |
+| **B** (semi-sync) | Yes | Yes, cleared on P_RECV_ACK | Data in peer RAM |
+| **C** (sync) | Yes | Yes, cleared on P_WRITE_ACK | Data on peer disk — default |
+
+```bash
+grep -n "RQ_EXP_WRITE_ACK\|RQ_EXP_RECEIVE_ACK\|drbd_prot_C\|prot_A\|prot_B" \
+    drbd/drbd_req.c drbd/drbd_int.h
+grep -n "on_no_data\|wire_protocol\|dp_flags" drbd/drbd_int.h | head -20
+```
+
+---
+
+## 9. The Transfer Log and Write Ordering
+
+```bash
+grep -n "transfer_log\|dagtag\|tl_requests" drbd/drbd_req.c drbd/drbd_receiver.c | head -20
+```
+
+The `resource->transfer_log` is an ordered list of all in-flight `drbd_request` objects, sorted by `dagtag`. Its purpose:
+
+1. **Write ordering on secondaries:** The secondary processes writes in dagtag order. If write B (dagtag=5) arrives before write A (dagtag=4) on the secondary, the secondary buffers B until A is processed.
+
+2. **Recovery after disconnect:** If a peer disconnects, DRBD walks the transfer log to mark all in-flight writes as OOS in the bitmap (those writes could not be replicated).
+
+```bash
+# Where the transfer log is walked on disconnect:
+grep -n "transfer_log\|tl_walk\|tl_restart" drbd/drbd_req.c drbd/drbd_main.c | head -20
+```
+
+---
+
+## 10. Hands-On Exercises (3–4 hours)
+
+### Exercise 1 (50 min): Read `drbd_req.c` fully
+It is ~1800 lines. For every function, write its name and one-line description. Pay special attention to:
+- `__drbd_make_request()` — the entry point
+- `__req_mod()` — the state machine
+- `drbd_req_complete()` — the completion check
+
+### Exercise 2 (30 min): Enumerate all `enum drbd_req_event` values
+```bash
+grep -n "enum drbd_req_event\b" drbd/drbd_req.h
+```
+For each event, identify: who sends it, what `rq_state` bits it clears/sets.
+
+### Exercise 3 (40 min): Trace a failed local write
+Start from `drbd_request_endio()` being called with `bio->bi_status != 0`. What state bits change? Does `bio_endio()` still get called? Does DRBD detach the disk? Under what conditions?
+
+```bash
+grep -n "WRITE_COMPLETED_WITH_ERROR\|drbd_handle_failed_mirror\|drbd_detach" drbd/drbd_req.c
+```
+
+### Exercise 4 (40 min): Read `get_ldev_if_state()` and understand `local_cnt`
+```bash
+grep -n "get_ldev_if_state\|put_ldev\|atomic.*local_cnt" drbd/drbd_int.h drbd/drbd_req.c
+```
+Why does DRBD need `local_cnt`? What would happen if a disk detach ran concurrently with an in-flight write?
+
+### Exercise 5 (30 min): Find all callers of `__req_mod()`
+```bash
+grep -n "__req_mod\b" drbd/drbd_req.c drbd/drbd_receiver.c drbd/drbd_sender.c
+```
+For each call site, identify: what event is being sent, from which file/function, and why.
+
+---
+
+## Summary
+
+`__drbd_make_request()` wraps each incoming bio in a `drbd_request`, reserves an activity log slot, inserts the request into the interval tree and transfer log, submits a cloned bio to the local disk, and enqueues the request for the sender thread. The `rq_state` bitmask tracks what must complete before `bio_endio()` is called. `__req_mod()` drives the request state machine from both the local disk completion callback and the network ACK handler. The replication protocol (A/B/C) determines which network events are required.
+
+**Next:** Day 5 — The network protocol: packet format, sender thread, barriers and epochs.
