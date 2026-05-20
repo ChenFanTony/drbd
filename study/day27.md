@@ -96,26 +96,50 @@ static int drbd_send_barrier(struct drbd_connection *connection)
 ### When Does a Barrier Get Sent?
 
 ```bash
-grep -n "drbd_send_barrier\b\|REQ_PREFLUSH\|REQ_FUA\|maybe_send_barrier\b" \
+grep -n "maybe_send_barrier\b\|start_new_tl_epoch\b\|current_tle_nr\b" \
     drbd/drbd_req.c drbd/drbd_sender.c | head -20
 ```
 
-In the sender thread, when processing a write request with flush/FUA flags:
+`drbd_send_barrier` is **only** called from `maybe_send_barrier()` in the sender
+thread. The trigger is an **epoch number mismatch**, not bio flags:
 
 ```c
-// drbd_sender.c or drbd_req.c:
-if (bio_op(req->master_bio) == REQ_OP_WRITE &&
-    (req->master_bio->bi_opf & (REQ_PREFLUSH | REQ_FUA))) {
-    // This write must be a barrier point
-    drbd_send_barrier(connection);
-}
-
-// Also triggered by max-epoch-size limit:
-if (atomic_read(&connection->current_epoch->epoch_size) >=
-    net_conf->max_epoch_size) {
-    drbd_send_barrier(connection);
+// drbd_sender.c:3444 — called before sending each write/read request
+static void maybe_send_barrier(struct drbd_connection *connection, unsigned int epoch)
+{
+    if (should_send_barrier(connection, epoch)) {
+        if (connection->send.current_epoch_writes)
+            drbd_send_barrier(connection);   // only place it is called
+        connection->send.current_epoch_nr = epoch;
+    }
 }
 ```
+
+Each request is stamped with a TLE (transfer log epoch) number at submission time
+(`drbd_req.c:2002`):
+
+```c
+req->epoch = atomic_read(&resource->current_tle_nr);
+```
+
+`current_tle_nr` is incremented by `start_new_tl_epoch()` in three situations:
+
+| Caller | Location | Condition |
+|---|---|---|
+| Write request local completion | `drbd_req.c:606` | write finishes on local disk |
+| `max-epoch-size` limit reached | `drbd_req.c:1185` | `current_tle_writes >= max_epoch_size` |
+| Device demotion | `drbd_main.c:2977` | primary → secondary role change |
+
+When the sender encounters a request whose `req->epoch` differs from
+`connection->send.current_epoch_nr`, it sends a `P_BARRIER` packet *before*
+sending that request, which closes the previous epoch on the secondary.
+
+**Empty flushes (`REQ_PREFLUSH` + `size == 0`) are a separate path** — they are
+handled by `drbd_process_empty_flush()` (`drbd_req.c:1630`) using a `BARRIER_SENT`
+state transition; they do **not** call `drbd_send_barrier` directly. The indirect
+link is: the flush causes prior writes to complete → those completions call
+`start_new_tl_epoch()` → the next write after the flush carries a new epoch number
+→ `maybe_send_barrier()` fires.
 
 ---
 
@@ -340,16 +364,19 @@ List all possible `epoch_event` values. For each: when is it called, what does i
 ### Exercise 2 (40 min): Trace an `fsync()` through DRBD
 Application calls `fsync(fd)` on a file on an ext4 filesystem mounted on `/dev/drbd0`:
 1. `fsync()` → VFS → ext4 journal commit
-2. ext4 submits `bio` with `REQ_PREFLUSH | REQ_FUA`
-3. DRBD's `drbd_make_request()` sees the flags
-4. `drbd_send_barrier()` is called
-5. Secondary receives `P_BARRIER`
-6. Secondary sends `P_BARRIER_ACK` after all writes durable
-7. Primary's `fsync()` returns to application
+2. ext4 submits an empty `bio` with `REQ_PREFLUSH` and `size == 0`
+3. DRBD's `drbd_make_request()` routes it to `drbd_process_empty_flush()` (`drbd_req.c:2013`)
+4. Prior write completions have already incremented `current_tle_nr` via `start_new_tl_epoch()`
+5. The next write after the flush carries a new `req->epoch`; `maybe_send_barrier()` detects the
+   mismatch and calls `drbd_send_barrier()` (`drbd_sender.c:3449`)
+6. Secondary receives `P_BARRIER`
+7. Secondary sends `P_BARRIER_ACK` after all writes in that epoch are durable
+8. Primary's `fsync()` returns to application
 
 Find each step in the code:
 ```bash
-grep -n "REQ_PREFLUSH\|REQ_FUA\|drbd_send_barrier\b\|P_BARRIER\b" drbd/drbd_req.c drbd/drbd_sender.c | head -20
+grep -n "REQ_PREFLUSH\|drbd_process_empty_flush\b\|start_new_tl_epoch\b\|maybe_send_barrier\b\|P_BARRIER\b" \
+    drbd/drbd_req.c drbd/drbd_sender.c | head -25
 ```
 
 ### Exercise 3 (40 min): Measure epoch size under fio workload
