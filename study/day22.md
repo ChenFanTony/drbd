@@ -258,35 +258,146 @@ grep -n "drbd_forward_write\b\|forward.*write\|P_FORWARDED_DATA\b" \
 
 ## 7. `dagtag` Write Ordering in Multi-Node Clusters
 
-In a 2-node cluster, write ordering is trivial: the single connection's sequence numbers enforce order. In multi-node clusters, the **dagtag** (data generation tag) provides a global order:
+**dagtag** = **data generation tag**. It is a 64-bit value in units of **512-byte
+sectors**, monotonically increasing per resource.  It is *not* a simple per-request
+counter — it advances by the size of each write.
 
 ```bash
-grep -n "dagtag\b\|dagtag_sector\b" drbd/drbd_int.h drbd/drbd_req.c drbd/drbd_receiver.c | head -20
+grep -n "dagtag_sector\b" drbd/drbd_int.h | head -10
 ```
 
 ```c
-// drbd_int.h
-struct drbd_resource {
-    atomic64_t dagtag_sector;   // global monotonic write sequence number
-};
+// drbd_int.h: struct drbd_resource
+u64 dagtag_sector;     // protected by tl_update_lock; advances by write size
 
-struct drbd_request {
-    u64 dagtag;    // this request's position in the global order
-};
+// drbd_int.h: struct drbd_request
+u64 dagtag_sector;     // this request's endpoint in the global sector stream
+
+// drbd_int.h: struct drbd_connection
+atomic64_t last_dagtag_sector;  // latest dagtag seen from this peer
 ```
 
-On the Primary:
+### Assignment (drbd_req.c:1994)
+
 ```c
-req->dagtag = atomic64_inc_return(&resource->dagtag_sector);
+// For writes: advance the resource counter by the write's size
+WRITE_ONCE(resource->dagtag_sector,
+           resource->dagtag_sector + (req->i.size >> 9));
+// For reads: no advance — just snapshot the current value
+req->dagtag_sector = resource->dagtag_sector;
 ```
 
-Dagtag is sent in `P_DATA` and `P_BARRIER` packets. Secondaries use it to enforce write order when writes from the same Primary arrive via different paths (direct and forwarded).
+Write A (4K) gets `dagtag = 8`, write B (4K) gets `dagtag = 16`, etc.  The
+dagtag encodes both **ordering** and **size** in one number.
+
+### Use 1: `P_DAGTAG` — gap filling on the sender side
+
+Each connection's sender tracks `connection->send.current_dagtag_sector`.
+Before sending a write, it checks whether the write's *start* dagtag matches
+where the connection currently is (`drbd_sender.c:3517`):
+
+```c
+u64 current_dagtag_sector = req->dagtag_sector - (req->i.size >> 9);
+if (current_dagtag_sector != connection->send.current_dagtag_sector)
+    drbd_send_dagtag(connection, current_dagtag_sector);
+connection->send.current_dagtag_sector = req->dagtag_sector;
+```
+
+A **gap** appears when some requests are not sent on this connection (reads, or
+writes going only to a subset of peers).  `P_DAGTAG` fills the gap so the
+receiver's `last_dagtag_sector` stays accurate.
+
+The receiver handler simply stores the value (`drbd_receiver.c:8833`):
+```c
+static int receive_dagtag(struct drbd_connection *connection, ...)
+{
+    set_connection_dagtag(connection, be64_to_cpu(p->dagtag));
+    // → atomic64_set(&connection->last_dagtag_sector, dagtag)
+    // → release_dagtag_wait(...)  ← wake any resync reads waiting on this
+    return 0;
+}
+```
+
+### Use 2: `depend_dagtag` — resync safety in 3-node clusters
+
+When a resync source (e.g. NodeB) asks a target (NodeC) to read a block, it
+attaches a `depend_dagtag` to the request (`send_resync_request`,
+`drbd_sender.c:431`):
+
+```c
+dagtag_result = find_current_dagtag(resource);
+// → if we are primary: our own resource->dagtag_sector
+// → if secondary: last_dagtag_sector from the connected primary
+```
+
+The target (NodeC) receives this via `depend_dagtag` in the peer_req.
+`drbd_peer_resync_read()` (`drbd_receiver.c:3682`) checks:
+
+```c
+if (peer_req->depend_dagtag &&
+    need_to_wait_for_dagtag_of_peer_request(peer_req)) {
+    // NodeC's last_dagtag_sector from the primary < depend_dagtag
+    // → NodeC hasn't received all primary writes yet
+    list_add_tail(&peer_req->w.list, &connection->dagtag_wait_ee);
+    return;   // parked
+}
+```
+
+When a subsequent `P_DATA` or `P_DAGTAG` advances `last_dagtag_sector` past
+`depend_dagtag`, `set_connection_dagtag()` calls `release_dagtag_wait()` which
+unparks the waiting resync read.
+
+**Why this matters:** without `depend_dagtag`, NodeC might read stale data (from
+before the primary's write) and send it to NodeB as "current", corrupting the
+resync.
+
+### Use 3: `P_PEER_DAGTAG` — sync direction after a primary disappears
+
+When a primary (NodeA) disconnects, surviving nodes need to decide who is ahead.
+A node that was connected to NodeA sends `P_PEER_DAGTAG` to other peers
+(`drbd_main.c:1802`):
+
+```c
+int drbd_send_peer_dagtag(struct drbd_connection *connection,
+                           struct drbd_connection *lost_peer)
+{
+    p->dagtag  = cpu_to_be64(atomic64_read(&lost_peer->last_dagtag_sector));
+    p->node_id = cpu_to_be32(lost_peer->peer_node_id);
+    return send_command(connection, -1, P_PEER_DAGTAG, DATA_STREAM);
+}
+```
+
+The receiver (`receive_peer_dagtag`, `drbd_receiver.c:8863`) compares:
+
+```c
+dagtag_offset = atomic64_read(&lost_peer->last_dagtag_sector)
+              - (s64)be64_to_cpu(p->dagtag);
+
+if      (dagtag_offset > 0) new_repl_state = L_WF_BITMAP_S;  // I am ahead → source
+else if (dagtag_offset < 0) new_repl_state = L_WF_BITMAP_T;  // I am behind → target
+else                         new_repl_state = L_ESTABLISHED;  // equal → no resync needed
+```
+
+### Use 4: Barrier timing safety
+
+The sender checks `seen_dagtag_sector` before sending a barrier
+(`drbd_sender.c:3391`):
+
+```c
+if (dagtag_newer_eq(connection->send.seen_dagtag_sector,
+                    READ_ONCE(resource->dagtag_sector))) {
+    // All in-flight writes have been seen → safe to send barrier
+    maybe_send_barrier(connection, connection->send.current_epoch_nr + 1);
+}
+```
+
+This prevents sending a barrier before a write that was assigned a dagtag but
+hasn't been picked up by the sender thread yet.
 
 ```bash
-grep -n "P_PEER_DAGTAG\b\|drbd_send_peer_dagtag\b" drbd/drbd-headers/drbd_protocol.h drbd/drbd_sender.c | head -10
+grep -n "dagtag_sector\b\|depend_dagtag\b\|dagtag_wait_ee\b\|set_connection_dagtag\b" \
+    drbd/drbd_req.c drbd/drbd_sender.c drbd/drbd_receiver.c | head -30
 ```
-
-`P_PEER_DAGTAG` is sent by a Secondary to peers after processing a write, so other nodes in the cluster can track the global write order.
 
 ---
 

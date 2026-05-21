@@ -142,7 +142,8 @@ drbd_submit_bio(bio)
 │           → mempool_alloc(&drbd_request_mempool, GFP_NOIO)
 │           → req->master_bio    = bio
 │           → req->device        = device
-│           → req->dagtag_sector = atomic64_inc_return(&resource->dagtag_sector)
+│           → resource->dagtag_sector += req->i.size >> 9  (writes only)
+│           → req->dagtag_sector = resource->dagtag_sector
 │
 ├─ 3. Activity log reservation (if write)
 │   └── drbd_al_begin_io_fastpath(device, &req->i)        ← cache HIT path
