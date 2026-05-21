@@ -151,9 +151,12 @@ drbd_submit_bio(bio)
 │             until drbd_al_begin_io_commit() runs
 │           → sets RQ_IN_ACT_LOG in local_rq_state on success
 │
-├─ 4. Insert into interval tree (overlap detection)
-│   └── drbd_insert_interval(&device->write_requests, &req->i)
-│           → rb_insert_augmented() in drbd_interval.c
+├─ 4. Conflict check + insert into interval tree
+│   └── drbd_conflict_submit_write(req)          ← drbd_req.c:2107
+│           → drbd_find_conflict(&device->requests, &req->i)
+│           → drbd_insert_interval(&device->requests, &req->i)
+│           → if no conflict: set INTERVAL_SUBMITTED, proceed
+│           → if conflict found: park in tree, deferred via submit_conflict wq
 │
 ├─ 5. Insert into transfer log (write ordering)
 │   └── list_add_tail(&req->tl_requests, &resource->transfer_log)
@@ -304,7 +307,7 @@ When `completion_ref` reaches zero, `drbd_req_complete()` triggers the master bi
 ```c
 if (atomic_dec_and_test(&req->completion_ref)) {
     // All pending work done
-    drbd_remove_interval(&device->write_requests, &req->i);
+    drbd_remove_interval(&device->requests, &req->i);
     list_del_init(&req->tl_requests);
     wake_up(&device->misc_wait);
 
