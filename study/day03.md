@@ -312,7 +312,210 @@ This function:
 
 ---
 
-## 10. Hands-On Exercises (3–4 hours)
+## 10. Distributed TWOPC: Cluster-Wide State Changes
+
+Section 3 describes the **local** begin/end commit pattern (spinlock, [NEW]/[NOW] fields). That is only half the story. For changes that must be agreed upon by all nodes — becoming Primary, connecting/disconnecting a peer, or resizing a device — DRBD runs a **distributed two-phase commit** over the network.
+
+### 10.1 When Is Distributed TWOPC Used?
+
+`change_cluster_wide_state()` (`drbd_state.c:4929`) decides:
+- If the change is `CS_LOCAL_ONLY` → purely local, no TWOPC.
+- If `try_state_change()` returns `SS_NOTHING_TO_DO` → nothing to propagate.
+- Otherwise → distributed TWOPC.
+
+Examples that trigger distributed TWOPC:
+| Operation | Function |
+|---|---|
+| `drbdadm primary` | `change_role()` → `change_cluster_wide_state()` |
+| Node connect/disconnect | `change_cstate_es()` |
+| Device resize | `change_cluster_wide_device_size()` |
+
+### 10.2 Packet Types
+
+```
+Initiator → Peers:   P_TWOPC_PREPARE   (phase 1: can you do this?)
+                     P_TWOPC_PREP_RSZ  (phase 1 variant for resize)
+
+Peers → Initiator:   P_TWOPC_YES       (I consent)
+                     P_TWOPC_NO        (I refuse)
+                     P_TWOPC_RETRY     (I'm busy, try again)
+
+Initiator → Peers:   P_TWOPC_COMMIT    (phase 2: do it)
+                     P_TWOPC_ABORT     (phase 2: don't)
+```
+
+### 10.3 Initiator Side: `change_cluster_wide_state()` (`drbd_state.c:4929`)
+
+```
+change_cluster_wide_state()
+  │
+  ├─ begin_state_change(CS_LOCAL_ONLY)   ← lock resource, set [NEW] fields
+  ├─ change(context, PH_PREPARE)         ← populate mask/val
+  ├─ try_state_change()                  ← validate locally (dry run)
+  │
+  ├─ Generate random tid
+  ├─ Set request.cmd = P_TWOPC_PREPARE
+  ├─ Set request.nodes_to_reach = all nodes not directly connected
+  │
+  ├─ begin_remote_state_change()         ← mark resource->remote_state_change = true
+  ├─ __cluster_wide_request()            ← send P_TWOPC_PREPARE to all direct peers
+  │     sets TWOPC_PREPARED bit per connection
+  │
+  ├─ wait_event_interruptible_timeout()  ← wait for cluster_wide_reply_ready()
+  │     (ack_receiver thread calls got_twopc_reply() which wakes us)
+  │
+  ├─ get_cluster_wide_reply()            ← any TWOPC_NO? → SS_CW_FAILED_BY_PEER
+  │                                         any TWOPC_RETRY? → SS_CONCURRENT_ST_CHG
+  │                                         all TWOPC_YES? → SS_CW_SUCCESS
+  │
+  ├─ [on success] request.cmd = P_TWOPC_COMMIT
+  ├─ [on failure] request.cmd = P_TWOPC_ABORT
+  │
+  ├─ end_remote_state_change()
+  ├─ change(context, PH_COMMIT) + end_state_change()  ← apply [NEW]→[NOW] locally
+  └─ twopc_phase2()                      ← send P_TWOPC_COMMIT or P_TWOPC_ABORT to peers
+```
+
+Key data: `resource->twopc_reply` accumulates votes; `resource->twopc.state_change.{mask,val}` carry the proposed change.
+
+### 10.4 Participant Side: `process_twopc()` (`drbd_receiver.c:7465`)
+
+When a node receives `P_TWOPC_PREPARE`:
+
+```
+receive_twopc()
+  └─ process_twopc()
+       │
+       ├─ check_concurrent_transactions()  ← is another TWOPC in progress?
+       │     CSC_CLEAR:       no conflict → proceed
+       │     CSC_MATCH:       duplicate → resend last reply
+       │     CSC_ABORT_LOCAL: local TWOPC must yield → abort_local_transaction()
+       │     CSC_REJECT:      cannot yield → send P_TWOPC_RETRY
+       │
+       ├─ Set resource->remote_state_change = true
+       ├─ Store received mask/val in resource->twopc.state_change
+       │
+       ├─ [P_TWOPC_PREPARE path]
+       │     flags |= CS_PREPARE
+       │     Decode state_change->mask, state_change->val from packet
+       │     Build reply.primary_nodes (am I Primary?)
+       │
+       ├─ change_peer_device_state() or change_connection_state() or far_away_change()
+       │     ← runs begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)
+       │        try_state_change() ← validate (but don't apply)
+       │        If OK → reply P_TWOPC_YES; If fail → reply P_TWOPC_NO
+       │
+       ├─ arm twopc_timer (timeout → auto-abort)
+       │
+       └─ nested_twopc_request()   ← forward to nodes in nodes_to_reach bitmap
+            └─ conn_send_twopc_request() for each indirect neighbor
+
+When P_TWOPC_COMMIT arrives:
+       │
+       ├─ flags |= CS_PREPARED  (match existing prepared transaction)
+       ├─ change_peer_device_state(CS_PREPARED) ← apply [NEW]→[NOW]
+       ├─ timer_delete(&resource->twopc_timer)
+       └─ nested_twopc_request()   ← forward COMMIT to indirect neighbors
+```
+
+### 10.5 Vote Collection: `got_twopc_reply()` (`drbd_receiver.c:10506`)
+
+This runs in the **ack_receiver thread** (separate from the initiator thread):
+
+```c
+// Per connection, set exactly one bit:
+if (P_TWOPC_YES)   set_bit(TWOPC_YES,   &connection->flags);
+if (P_TWOPC_NO)    set_bit(TWOPC_NO,    &connection->flags);
+if (P_TWOPC_RETRY) set_bit(TWOPC_RETRY, &connection->flags);
+
+drbd_maybe_cluster_wide_reply(resource);  // wake initiator if all replied
+```
+
+`cluster_wide_reply_ready()` (`drbd_state.c:4555`) scans all connections with `TWOPC_PREPARED` set and returns `true` when all have replied YES, or any has replied NO/RETRY.
+
+### 10.6 Indirect Routing (Non-Fully-Connected Clusters)
+
+DRBD clusters need not be fully connected (e.g., A↔B and B↔C but not A↔C). The `nodes_to_reach` field (64-bit bitmask) handles this:
+
+```
+Initiator A sends P_TWOPC_PREPARE to B with nodes_to_reach = {C}
+
+B receives it:
+  ├─ Votes YES to A directly (P_TWOPC_YES → A)
+  └─ Forwards P_TWOPC_PREPARE to C (after removing B from nodes_to_reach)
+
+C votes YES to B (P_TWOPC_YES → B)
+
+B forwards C's reply upstream (nested_twopc_work → twopc_end_nested)
+```
+
+`nested_twopc_abort()` (`drbd_receiver.c:7303`) handles forwarding of P_TWOPC_ABORT to nodes that were only reachable indirectly.
+
+### 10.7 Concurrent Transactions and Retry
+
+Two nodes can simultaneously initiate TWOPC (e.g., A tries to become Primary while B tries to connect). `check_concurrent_transactions()` (`drbd_state.c`) uses the `tid` and `initiator_node_id` to detect this:
+
+- **Same initiator, different TID**: `CSC_TID_MISS` → one must wait or send `P_TWOPC_RETRY`
+- **Different initiator**: `CSC_REJECT` → refuse with `P_TWOPC_RETRY`
+- **Local TWOPC conflicts**: `CSC_ABORT_LOCAL` → abort local, yield to remote
+
+On retry, `change_cluster_wide_state()` uses exponential backoff (`twopc_retry_timeout()`):
+```c
+if (rv == SS_TIMEOUT || rv == SS_CONCURRENT_ST_CHG) {
+    long timeout = twopc_retry_timeout(resource, retries++);
+    schedule_timeout_interruptible(timeout);
+    goto retry;  // drbd_state.c:5205
+}
+```
+
+### 10.8 Full Example: `drbdadm primary r0` on Node A
+
+```
+NodeA (initiator)               NodeB (participant)
+─────────────────               ──────────────────
+change_role()
+  change_cluster_wide_state()
+    tid = random()
+    P_TWOPC_PREPARE ──────────→ receive_twopc()
+    (mask=role, val=Primary)       process_twopc()
+                                     check_concurrent_transactions() → CSC_CLEAR
+                                     change_peer_device_state(CS_PREPARE)
+                                     try_state_change() → SS_SUCCESS
+                                     arm twopc_timer
+    ←──────────────── P_TWOPC_YES  (primary_nodes=0, no Primary on B)
+    got_twopc_reply()
+      set_bit(TWOPC_YES, &connB->flags)
+      cluster_wide_reply_ready() → true
+    wait returns
+    get_cluster_wide_reply() → SS_CW_SUCCESS
+    (no TWOPC_NO, no TWOPC_RETRY)
+    request.cmd = P_TWOPC_COMMIT
+    end_remote_state_change()
+    change(PH_COMMIT)
+    end_state_change()          (role[NOW] = R_PRIMARY on A)
+    twopc_phase2():
+    P_TWOPC_COMMIT ───────────→ process_twopc()
+                                   flags = CS_PREPARED
+                                   change_connection_state(CS_PREPARED)
+                                   apply_state_change()  ← peer's role[NOW] = R_PRIMARY
+                                   timer_delete()
+                                   nested_twopc_request() (no further nodes)
+```
+
+### 10.9 Key Differences: Local vs Distributed Commit
+
+| Aspect | Local (`begin/end_state_change`) | Distributed (`change_cluster_wide_state`) |
+|---|---|---|
+| Scope | Single node | All reachable nodes |
+| Lock | `state_rwlock` spinlock | `state_rwlock` + network round-trip |
+| Packets | None | `P_TWOPC_PREPARE` → votes → `P_TWOPC_COMMIT` |
+| Failure | Immediate `SS_*` error | `SS_CW_FAILED_BY_PEER` or `SS_TIMEOUT` |
+| Retry | No | Yes (exponential backoff) |
+| Flag | `CS_LOCAL_ONLY` to bypass | None (default path) |
+
+---
+
+## 11. Hands-On Exercises (3–4 hours)
 
 ### Exercise 1 (45 min): Full read of `drbd_state.c`
 Open the file, read every function. For each function write its name + one sentence purpose in a notebook. Estimated: ~1500 lines.
@@ -342,10 +545,36 @@ grep -n "receive_state\b" drbd/drbd_receiver.c
 ```
 Draw the message exchange for a node coming back online and triggering resync.
 
+### Exercise 6 (45 min): Trace a full distributed TWOPC
+```bash
+# Initiator path
+grep -n "change_cluster_wide_state\b" drbd/drbd_state.c | head -5
+grep -n -A 350 "^change_cluster_wide_state\b" drbd/drbd_state.c | head -350
+
+# Participant path
+grep -n -A 380 "^static void process_twopc\b" drbd/drbd_receiver.c | head -380
+
+# Vote collection
+grep -n -A 60 "^static int got_twopc_reply\b" drbd/drbd_receiver.c | head -60
+```
+1. Starting from `change_role()`, trace to `P_TWOPC_PREPARE` being sent.
+2. On the receiving node, trace from `receive_twopc()` to `P_TWOPC_YES`.
+3. Back on the initiator, trace from `got_twopc_reply()` to `P_TWOPC_COMMIT`.
+4. Draw a message-sequence diagram for a 3-node cluster where one node is unreachable via indirect routing.
+
+### Exercise 7 (30 min): Concurrent TWOPC
+```bash
+grep -n "check_concurrent_transactions\|CSC_ABORT_LOCAL\|CSC_REJECT\|CSC_TID_MISS\|abort_local_transaction" \
+    drbd/drbd_state.c drbd/drbd_receiver.c
+```
+For each of the four `csc_rv` outcomes (`CSC_CLEAR`, `CSC_MATCH`, `CSC_ABORT_LOCAL`, `CSC_REJECT`/`CSC_TID_MISS`), write the scenario that triggers it and the resulting action.
+
 ---
 
 ## Summary
 
-DRBD's state machine uses a two-phase begin/end commit pattern under `req_lock`. The `[NOW]`/`[NEW]` field pair allows multi-object atomic transitions. `sanitize_state()` enforces invariants automatically; `is_valid_transition()` rejects illegal requests with typed error codes. Post-change work (I/O resumption, peer notification, resync start) happens in `__after_state_change()` outside the lock. State changes propagate to peers via `P_STATE` packets and are processed by `receive_state()` on the remote side.
+DRBD's state machine has two layers. The **local layer** uses a begin/end commit pair under `state_rwlock`: `begin_state_change()` locks and copies states to `[NEW]`; `sanitize_state()` enforces invariants; `is_valid_transition()` rejects illegal changes; `apply_state_change()` writes `[NEW]→[NOW]`; `__after_state_change()` triggers side effects outside the lock.
+
+The **distributed layer** runs a network-level two-phase commit for cluster-wide changes. The initiator calls `change_cluster_wide_state()`, sends `P_TWOPC_PREPARE` to all reachable nodes (with `nodes_to_reach` bitmask for indirect forwarding), collects `P_TWOPC_YES`/`P_TWOPC_NO`/`P_TWOPC_RETRY` votes, then sends `P_TWOPC_COMMIT` or `P_TWOPC_ABORT`. Participants receive and validate locally before voting. Concurrent transactions are detected and resolved via retry with exponential backoff.
 
 **Next:** Day 4 — The write request path: from `drbd_make_request()` to `bio_endio()`.
