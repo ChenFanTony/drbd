@@ -401,7 +401,212 @@ grep -n "dagtag_sector\b\|depend_dagtag\b\|dagtag_wait_ee\b\|set_connection_dagt
 
 ---
 
-## 8. Multi-Node Resync Coordination
+## 8. Dual-Primary with Protocol C — Full Write Path
+
+This is the most important topology to understand deeply: two nodes both promoted
+to Primary, `two_primaries = yes`, `protocol C`.
+
+### 8.1 Configuration constraint
+
+```bash
+grep -n "two_primaries.*PROT_C\|ERR_NOT_PROTO_C" drbd/drbd_nl.c | head -5
+```
+
+`drbd_nl.c:3949`:
+```c
+if (new_net_conf->two_primaries &&
+    (new_net_conf->wire_protocol != DRBD_PROT_C))
+    return ERR_NOT_PROTO_C;
+```
+
+**`two_primaries = yes` is enforced to require Protocol C.**  This is not a
+convention — the kernel rejects the configuration otherwise.  Protocol C means
+`bio_endio()` fires only after BOTH local disk completion AND `P_WRITE_ACK` from
+the peer.
+
+### 8.2 Symmetric roles
+
+Each node simultaneously plays **two roles** on the same connection:
+
+```
+NodeA                              NodeB
+  Primary (write initiator)  ←→   Primary (write initiator)
+  Secondary (write receiver) ←→   Secondary (write receiver)
+
+NodeA's own writes → P_DATA →→→ NodeB receives, writes locally, sends P_WRITE_ACK
+NodeB's own writes → P_DATA →→→ NodeA receives, writes locally, sends P_WRITE_ACK
+```
+
+The sender thread on each node drains its own transfer log and sends P_DATA for
+its own writes.  The receiver thread on each node processes incoming P_DATA from
+the peer and triggers local I/O.
+
+### 8.3 Write path on NodeA (write initiator side)
+
+This is the standard `drbd_make_request()` path (day04) with one key difference:
+
+```c
+// drbd_req.c (fan-out loop)
+for_each_peer_device(peer_device, device) {
+    int idx = peer_device->node_id;
+    req->net_rq_state[idx] |= RQ_NET_PENDING | RQ_EXP_WRITE_ACK | RQ_EXP_BARR_ACK;
+    atomic_inc(&req->completion_ref);   // +1 for this peer
+}
+// +1 for local disk → completion_ref starts at 2 in a 2-node cluster
+```
+
+NodeA's `completion_ref` starts at 2 (local + 1 peer).  `bio_endio()` fires when
+both decrement it to zero:
+- Local disk endio → `__req_mod(COMPLETED_OK)` → `completion_ref--`
+- `P_WRITE_ACK` from NodeB → `got_BlockAck()` → `__req_mod(WRITE_ACKED_BY_PEER)` → `completion_ref--`
+
+### 8.4 Write path on NodeB (write receiver side)
+
+NodeB's receiver thread calls `receive_Data()`.  The `tp` (two_primaries) flag
+drives three additional steps (`drbd_receiver.c:3321`):
+
+```c
+tp = nc->two_primaries;
+
+/* Step 1: Protocol C is asserted */
+D_ASSERT(device, d.dp_flags & DP_SEND_WRITE_ACK);  // enforced — drbd_receiver.c:3349
+peer_req->flags |= EE_SEND_WRITE_ACK;
+
+/* Step 2: peer_seq ordering — serialise NodeA's writes arriving on NodeB */
+if (tp) {
+    err = wait_for_and_update_peer_seq(peer_device, d.peer_seq);
+    // Blocks until peer_seq - 1 has been processed.
+    // Guards against packet reordering within NodeA's stream.
+}
+
+/* Step 3: hard conflict detection against NodeB's own local writes */
+if (tp) {
+    err = drbd_peer_write_conflicts(peer_req);  // drbd_receiver.c:3384
+    if (err)
+        goto out_del_list;  // → disconnect
+}
+```
+
+After passing all three steps, NodeB inserts the `peer_req` into the interval
+tree, submits a local bio, and on bio completion runs `e_end_block()`:
+
+```c
+// drbd_receiver.c: e_end_block()
+if (peer_req->flags & EE_SEND_WRITE_ACK) {
+    pcmd = P_WRITE_ACK;
+    drbd_send_ack(peer_device, pcmd, peer_req);
+}
+```
+
+`P_WRITE_ACK` carries `block_id = (u64)(uintptr_t)req` (the pointer NodeA put in
+the P_DATA header), allowing NodeA to look up the request in O(1).
+
+### 8.5 What `drbd_peer_write_conflicts()` actually detects
+
+```bash
+grep -n -A 20 "^static int drbd_peer_write_conflicts\b" drbd/drbd_receiver.c
+```
+
+```c
+// drbd_receiver.c:3012
+static int drbd_peer_write_conflicts(struct drbd_peer_request *peer_req)
+{
+    // Look for a LOCAL_WRITE (NodeB's own application write) overlapping
+    // the sector range of the incoming peer write from NodeA.
+    i = drbd_find_conflict(device, &peer_req->i, CONFLICT_FLAG_APPLICATION_ONLY);
+    if (i) {
+        drbd_alert(device,
+            "Concurrent writes detected: local=%llus +%u, remote=%llus +%u\n",
+            i->sector, i->size, sector, size);
+        return -EBUSY;   // → disconnect
+    }
+    return 0;
+}
+```
+
+The check fires only when NodeA and NodeB write to the **same sector at the same
+time**.  It is NOT the normal path — it is the error path that forces reconnection
+and split-brain recovery.
+
+A false positive cannot occur in normal operation: if NodeA and NodeB each write
+different sectors, `drbd_find_conflict()` returns NULL and both proceed without
+interference.
+
+### 8.6 Epoch/barrier independence in dual-primary
+
+Each node independently manages its own epochs on the connection.  The sender of
+each node sends `P_BARRIER` to the peer when its own write stream crosses an epoch
+boundary (via `maybe_send_barrier()`, triggered by `start_new_tl_epoch()`).
+
+```
+NodeA sender thread:          NodeB sender thread:
+  ... sends P_DATA_1 ...          ... sends P_DATA_A ...
+  ... sends P_DATA_2 ...          ... sends P_DATA_B ...
+  sends P_BARRIER(nr=5)           sends P_BARRIER(nr=3)
+  ... sends P_DATA_3 ...          ...
+
+NodeB receiver receives:      NodeA receiver receives:
+  P_DATA_1, P_DATA_2              P_DATA_A, P_DATA_B
+  P_BARRIER(5) → sends            P_BARRIER(3) → sends
+    P_BARRIER_ACK(5)                P_BARRIER_ACK(3)
+```
+
+The barrier numbers are independent per direction.  NodeA's epoch numbering is
+unrelated to NodeB's.
+
+### 8.7 dagtag in dual-primary
+
+Each node's `resource->dagtag_sector` advances only for its **own** local writes.
+When NodeB receives a write from NodeA via `receive_Data()`, the peer_req is
+assigned a dagtag from NodeB's tracking of NodeA's stream
+(`drbd_receiver.c:3357`):
+
+```c
+peer_req->dagtag_sector =
+    atomic64_read(&connection->last_dagtag_sector) + (peer_req->i.size >> 9);
+// ...
+set_connection_dagtag(connection, peer_req->dagtag_sector);
+// → atomic64_set(&connection->last_dagtag_sector, peer_req->dagtag_sector)
+```
+
+If NodeA sent a gap (reads, or missed writes) before this P_DATA, the sender
+already sent a `P_DAGTAG` to NodeB, which updated `last_dagtag_sector` via
+`receive_dagtag()`.  This ensures `peer_req->dagtag_sector` is always a correct
+cumulative count of NodeA's write stream as seen by NodeB.
+
+### 8.8 Complete symmetric picture
+
+```
+NodeA writes sector 100 (4K)         NodeB writes sector 200 (4K)
+│                                     │
+▼                                     ▼
+drbd_make_request()                   drbd_make_request()
+  local_bio submitted to disk           local_bio submitted to disk
+  completion_ref = 2                    completion_ref = 2
+  sender sends P_DATA(100) →→→         sender sends P_DATA(200) →→→
+                        ↓                              ↓
+             NodeB receive_Data(100)       NodeA receive_Data(200)
+               peer_seq check               peer_seq check
+               drbd_peer_write_conflicts()  drbd_peer_write_conflicts()
+                 → no conflict (200≠100)      → no conflict (100≠200)
+               submit local bio              submit local bio
+               local disk completes          local disk completes
+               e_end_block()                 e_end_block()
+               send P_WRITE_ACK(100)→→→     send P_WRITE_ACK(200)→→→
+                              ↓                            ↓
+                  NodeA got_BlockAck()          NodeB got_BlockAck()
+                  WRITE_ACKED_BY_PEER           WRITE_ACKED_BY_PEER
+                  completion_ref-- → 0          completion_ref-- → 0
+                  bio_endio() ✓                 bio_endio() ✓
+```
+
+Both nodes' local disk completions and P_WRITE_ACKs happen in parallel and
+independently.  There is no serialization between NodeA's write and NodeB's write
+as long as they target different sectors.
+
+---
+
+## 9. Multi-Node Resync Coordination
 
 In a 3-node cluster (A Primary/UpToDate, B Inconsistent, C UpToDate), when B reconnects:
 

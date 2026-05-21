@@ -340,6 +340,25 @@ grep -n "RQ_EXP_WRITE_ACK\|RQ_EXP_RECEIVE_ACK\|drbd_prot_C\|prot_A\|prot_B" \
 grep -n "on_no_data\|wire_protocol\|dp_flags" drbd/drbd_int.h | head -20
 ```
 
+### Dual-primary with Protocol C
+
+`two_primaries = yes` is enforced to require Protocol C (`drbd_nl.c:3949`).  In
+this mode each node simultaneously runs the write path above for its **own**
+writes, AND runs `receive_Data()` for the peer's writes.  The `completion_ref`
+for a write on NodeA starts at 2 (local + NodeB peer), and only drops to zero
+when both NodeA's local disk completes **and** NodeB sends `P_WRITE_ACK`.
+NodeB's own writes run the same path in reverse.
+
+The critical extra step on the **receiver** side (NodeB receiving NodeA's write):
+```c
+// drbd_receiver.c receive_Data(), two_primaries path
+err = wait_for_and_update_peer_seq(peer_device, d.peer_seq); // in-order delivery
+err = drbd_peer_write_conflicts(peer_req);  // detect same-sector concurrent write
+```
+If `drbd_peer_write_conflicts()` finds NodeB has a `INTERVAL_LOCAL_WRITE` at the
+same sector, it returns `-EBUSY` and DRBD disconnects.  See day12 Section 8 and
+day22 Section 8 for the full treatment.
+
 ---
 
 ## 9. The Transfer Log and Write Ordering

@@ -141,6 +141,35 @@ link is: the flush causes prior writes to complete → those completions call
 `start_new_tl_epoch()` → the next write after the flush carries a new epoch number
 → `maybe_send_barrier()` fires.
 
+### Dual-primary: barriers are independent per direction
+
+In dual-primary (`two_primaries = yes`, Protocol C), each node runs the sender
+thread for its **own** writes, and runs the receiver thread for the **other** node's
+writes.  Epoch management is completely symmetric and independent:
+
+- **NodeA's sender** sends `P_BARRIER` to NodeB when NodeA's TLE epoch turns over.
+  NodeB's receiver processes it via `receive_Barrier()`, advances NodeB's
+  `current_epoch` for that connection, and eventually sends `P_BARRIER_ACK` back.
+- **NodeB's sender** sends `P_BARRIER` to NodeA when NodeB's TLE epoch turns over.
+  NodeA's receiver processes it independently.
+
+The two barrier streams (A→B and B→A) have **separate monotonically increasing
+`barrier_nr` sequences** and are never mixed.  NodeA's `barrier_nr=5` on the A→B
+stream has nothing to do with NodeB's `barrier_nr=3` on the B→A stream.
+
+```
+NodeA sender:                           NodeB sender:
+  TLE epoch boundary → P_BARRIER(5)      TLE epoch boundary → P_BARRIER(3)
+    ↓                                       ↓
+NodeB receiver:                         NodeA receiver:
+  receive_Barrier() → advance epoch        receive_Barrier() → advance epoch
+  drbd_may_finish_epoch()                  drbd_may_finish_epoch()
+  all writes durable → P_BARRIER_ACK(5)   all writes durable → P_BARRIER_ACK(3)
+    ↓                                       ↓
+NodeA ack_receiver:                     NodeB ack_receiver:
+  got_BarrierAck(5)                        got_BarrierAck(3)
+```
+
 ---
 
 ## 4. Epoch Lifecycle on the Secondary
