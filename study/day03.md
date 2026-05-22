@@ -107,29 +107,40 @@ void begin_state_change(struct drbd_resource *resource,
     // So callers can read [NEW] and modify it
 }
 
-// Phase 2: Commit — validate, apply [NEW]→[NOW], run callbacks
-enum drbd_state_rv end_state_change(struct drbd_resource *resource,
-                                     unsigned long *irq_flags,
-                                     const char *tag)
+// Phase 2: Commit — validate, apply [NEW]→[NOW], queue post-change work
+// end_state_change() (line 981) → __end_state_change() (line 964)
+//   → ___end_state_change() (line 787) — does the real work
+static enum drbd_state_rv ___end_state_change(struct drbd_resource *resource, ...)
 {
-    // 1. Sanitize [NEW] values (may auto-adjust)
-    sanitize_state(resource);
+    // 1. Validate + sanitize (inside try_state_change())
+    rv = try_state_change(resource);   // calls sanitize_state() + is_valid_transition()
+    if (rv < SS_SUCCESS) goto out;
+    if (flags & CS_PREPARE) goto out;  // TWOPC prepare: don't apply yet
 
-    // 2. Validate the proposed transition
-    rv = is_valid_transition(resource);
-    if (rv < SS_SUCCESS) {
-        abort_state_change(resource, irq_flags, tag);
-        return rv;
+    // 2. Pre-apply housekeeping
+    finish_state_change(resource, tag);
+
+    // 3. Snapshot the change for the work item (before overwriting)
+    work = alloc_after_state_change_work(resource);
+
+    // 4. Inline [NEW] → [NOW] copy (drbd_state.c:827)
+    smp_wmb();
+    resource->role[NOW] = resource->role[NEW];
+    for_each_connection(connection, resource) {
+        connection->cstate[NOW] = connection->cstate[NEW];
+        ...
     }
+    idr_for_each_entry(&resource->devices, device, vnr) {
+        device->disk_state[NOW] = device->disk_state[NEW];
+        for_each_peer_device(peer_device, device) {
+            peer_device->repl_state[NOW] = peer_device->repl_state[NEW];
+            ...
+        }
+    }
+    wake_up_all(&resource->state_wait);
 
-    // 3. Apply: copy [NEW] → [NOW] for all objects
-    apply_state_change(resource);
-
-    // 4. Unlock
-    spin_unlock_irqrestore(&resource->req_lock, *irq_flags);
-
-    // 5. Post-change callbacks (outside lock)
-    __after_state_change(resource, ...);
+    // 5. Queue post-change work (runs outside the lock in worker thread)
+    queue_after_state_change_work(resource, done, work);
 }
 ```
 
@@ -144,17 +155,20 @@ Call chain:
 drbdadm primary r0
   → Netlink message → drbd_nl.c: drbd_adm_primary()
       → change_role(resource, R_PRIMARY, CS_VERBOSE, ...)
-          → begin_state_change(resource, &irq_flags, flags)
-          → __change_role(resource, R_PRIMARY)
-              → resource->role[NEW] = R_PRIMARY
-          → end_state_change(resource, &irq_flags, "primary")
-              → sanitize_state()
-              → is_valid_transition() — checks quorum, peer states
-              → apply_state_change() — role[NOW] = R_PRIMARY
-              → __after_state_change()
-                  → send P_STATE to all peers
-                  → notify_role_change() → udev event
-                  → resume I/O if was suspended
+          → change_cluster_wide_state(do_change_role, ...)   [if peers exist]
+              → begin_state_change(resource, &irq_flags, CS_LOCAL_ONLY)
+              → __change_role(): resource->role[NEW] = R_PRIMARY
+              → [TWOPC prepare/commit with peers — see Section 10]
+              → end_state_change(resource, &irq_flags, "primary")
+                  → ___end_state_change()
+                      → try_state_change()    — sanitize + validate
+                      → finish_state_change()
+                      → role[NOW] = role[NEW] — inline copy (line 827)
+                      → queue_after_state_change_work()
+                          → w_after_state_change() [runs in worker thread]
+                              → send P_STATE to all peers
+                              → drbd_notify_peers() → udev event
+                              → resume I/O if was suspended
 ```
 
 ---
@@ -214,49 +228,59 @@ grep -n "SS_\|enum drbd_state_rv" drbd/linux/drbd.h drbd/drbd_state.h | head -40
 
 ---
 
-## 6. `apply_state_change()` — Writing [NEW] → [NOW]
+## 6. `___end_state_change()` — Applying [NEW] → [NOW] (`drbd_state.c:787`)
+
+There is no separate `apply_state_change()` function. The `[NEW]→[NOW]` copy is done **inline** inside `___end_state_change()`. Find it:
 
 ```bash
-grep -n -A 50 "^static void apply_state_change\b" drbd/drbd_state.c
+grep -n -A 120 "^static enum drbd_state_rv ___end_state_change\b" drbd/drbd_state.c | head -120
 ```
 
-This function iterates all objects and copies `[NEW]` to `[NOW]`:
+The copy sequence (lines 827–878):
 
 ```c
-static void apply_state_change(struct drbd_resource *resource)
-{
-    struct drbd_connection *connection;
-    struct drbd_device *device;
-    struct drbd_peer_device *peer_device;
+smp_wmb();   // ensure state is visible before anything that depends on it
 
-    // Apply resource-level states
-    resource->role[NOW] = resource->role[NEW];
-    resource->susp[NOW] = resource->susp[NEW];
+// Resource-level
+resource->role[NOW]        = resource->role[NEW];
+resource->susp_user[NOW]   = resource->susp_user[NEW];
+resource->susp_nod[NOW]    = resource->susp_nod[NEW];
+resource->susp_quorum[NOW] = resource->susp_quorum[NEW];
+resource->fail_io[NOW]     = resource->fail_io[NEW];
 
-    // Apply per-device states
-    idr_for_each_entry(&resource->devices, device, vnr) {
-        device->disk_state[NOW] = device->disk_state[NEW];
-    }
+// Per-connection
+for_each_connection(connection, resource) {
+    connection->cstate[NOW]    = connection->cstate[NEW];
+    connection->peer_role[NOW] = connection->peer_role[NEW];
+    connection->susp_fen[NOW]  = connection->susp_fen[NEW];
+}
 
-    // Apply per-peer-device states
-    for_each_connection(connection, resource) {
-        connection->cstate[NOW] = connection->cstate[NEW];
-        idr_for_each_entry(&connection->peer_devices, peer_device, vnr) {
-            peer_device->repl_state[NOW] = peer_device->repl_state[NEW];
-            peer_device->disk_state[NOW] = peer_device->disk_state[NEW];
-        }
+// Per-device and per-peer-device
+idr_for_each_entry(&resource->devices, device, vnr) {
+    device->disk_state[NOW]    = device->disk_state[NEW];
+    device->have_quorum[NOW]   = device->have_quorum[NEW];
+    for_each_peer_device(peer_device, device) {
+        peer_device->disk_state[NOW]  = peer_device->disk_state[NEW];
+        peer_device->repl_state[NOW]  = peer_device->repl_state[NEW];
+        peer_device->resync_susp_user[NOW] = ...;
+        ...
     }
 }
+
+wake_up_all(&resource->state_wait);
+queue_after_state_change_work(resource, done, work);
 ```
+
+The three-level call chain: `end_state_change()` (line 981) → `__end_state_change()` (line 964) → `___end_state_change()` (line 787).
 
 ---
 
-## 7. `__after_state_change()` — Post-Change Actions
+## 7. `w_after_state_change()` — Post-Change Actions (`drbd_state.c:3822`)
 
-This is called **outside** the spinlock. It is where the real work happens after a state change:
+There is no `__after_state_change()` function. Post-change side effects run in the **worker thread** via a queued work item. The work item is allocated in `___end_state_change()` (before the state is applied), then dispatched to the resource's worker thread:
 
 ```bash
-grep -n -A 200 "^static void __after_state_change\b" drbd/drbd_state.c
+grep -n -A 200 "^static int w_after_state_change\b" drbd/drbd_state.c | head -200
 ```
 
 Key actions triggered by specific transitions:
