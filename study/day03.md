@@ -457,7 +457,73 @@ drbd_maybe_cluster_wide_reply(resource);  // wake initiator if all replied
 
 `cluster_wide_reply_ready()` (`drbd_state.c:4555`) scans all connections with `TWOPC_PREPARED` set and returns `true` when all have replied YES, or any has replied NO/RETRY.
 
-### 10.6 Indirect Routing (Non-Fully-Connected Clusters)
+### 10.6 Locking on the Participant During TWOPC
+
+A key question: does the participant hold `state_rwlock` for the entire PREPARE→COMMIT window?
+
+**No.** `state_rwlock` is a spinlock — it cannot sleep, so it cannot be held across a network round-trip. Instead, DRBD uses two separate mechanisms with different scopes.
+
+#### `state_rwlock` — held briefly, twice
+
+On **P_TWOPC_PREPARE** (`drbd_state.c:918`, `787`):
+```
+begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)
+  → write_lock_irqsave(&state_rwlock)       ← acquire
+  → ___begin_state_change(): copy NOW → NEW
+  → try_state_change(): sanitize + validate
+  → if (flags & CS_PREPARE) goto out;       ← skip apply
+  → write_unlock_irqrestore(&state_rwlock)  ← release
+```
+
+On **P_TWOPC_COMMIT** (`drbd_state.c:787`):
+```
+begin_state_change(CS_PREPARED | CS_LOCAL_ONLY)
+  → write_lock_irqsave(&state_rwlock)       ← acquire
+  → ___begin_state_change(): copy NOW → NEW
+  → try_state_change(): validate
+  → inline NEW → NOW copy (line 827)        ← apply
+  → __clear_remote_state_change()           ← flag cleared (line 911)
+  → write_unlock_irqrestore(&state_rwlock)  ← release
+```
+
+`state_rwlock` is **free** between PREPARE and COMMIT.
+
+#### `resource->remote_state_change` — held for the full PREPARE→COMMIT window
+
+Set to `true` in `process_twopc()` when PREPARE arrives; cleared inside `___end_state_change()` at `drbd_state.c:911` only when COMMIT or ABORT is processed:
+```c
+if ((flags & CS_TWOPC) && !(flags & CS_PREPARE))
+    __clear_remote_state_change(resource);  // sets remote_state_change = false
+```
+
+Any node that tries to start a new state change during this window hits `complete_remote_state_change()` (`drbd_state.c:4453`), which releases the spinlock and sleeps:
+```c
+wait_event_timeout(resource->twopc_wait,
+                   when_done_lock(resource, irq_flags),
+                   twopc_timeout(resource));
+```
+
+The worker thread takes a faster path (`drbd_state.c:4996`):
+```c
+if (current == resource->worker.task && resource->remote_state_change)
+    return SS_CONCURRENT_ST_CHG;   // fail immediately
+```
+
+#### `state_sem` — not held on the participant
+
+`state_sem` is only acquired when `CS_SERIALIZE` is in the flags (`state_change_lock()`, `drbd_state.c:920`). The participant uses `CS_LOCAL_ONLY` without `CS_SERIALIZE`, so it never takes this semaphore. Only the TWOPC initiator acquires `state_sem` (via `change_role()` → `CS_SERIALIZE`).
+
+#### Summary
+
+| Mechanism | Type | Held PREPARE→COMMIT? | Purpose |
+|---|---|---|---|
+| `state_rwlock` | rwlock (spinlock) | No — two brief critical sections | Protect [NOW]/[NEW] field copies |
+| `resource->remote_state_change` | boolean flag | **Yes — full duration** | Block any new state change from starting |
+| `state_sem` | semaphore | No (participant never acquires it) | Serialize initiator-side TWOPC only |
+
+The `twopc_timer` (`drbd_int.h`) provides the safety net: if COMMIT never arrives within `twopc_timeout`, it fires and auto-aborts, clearing `remote_state_change`.
+
+### 10.7 Indirect Routing (Non-Fully-Connected Clusters)
 
 DRBD clusters need not be fully connected (e.g., A↔B and B↔C but not A↔C). The `nodes_to_reach` field (64-bit bitmask) handles this:
 
@@ -475,7 +541,7 @@ B forwards C's reply upstream (nested_twopc_work → twopc_end_nested)
 
 `nested_twopc_abort()` (`drbd_receiver.c:7303`) handles forwarding of P_TWOPC_ABORT to nodes that were only reachable indirectly.
 
-### 10.7 Concurrent Transactions and Retry
+### 10.8 Concurrent Transactions and Retry
 
 Two nodes can simultaneously initiate TWOPC (e.g., A tries to become Primary while B tries to connect). `check_concurrent_transactions()` (`drbd_state.c`) uses the `tid` and `initiator_node_id` to detect this:
 
@@ -492,7 +558,7 @@ if (rv == SS_TIMEOUT || rv == SS_CONCURRENT_ST_CHG) {
 }
 ```
 
-### 10.8 Full Example: `drbdadm primary r0` on Node A
+### 10.9 Full Example: `drbdadm primary r0` on Node A
 
 ```
 NodeA (initiator)               NodeB (participant)
@@ -526,7 +592,7 @@ change_role()
                                    nested_twopc_request() (no further nodes)
 ```
 
-### 10.9 Key Differences: Local vs Distributed Commit
+### 10.10 Key Differences: Local vs Distributed Commit
 
 | Aspect | Local (`begin/end_state_change`) | Distributed (`change_cluster_wide_state`) |
 |---|---|---|
