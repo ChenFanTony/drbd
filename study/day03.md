@@ -541,25 +541,41 @@ A key question: does the participant hold `state_rwlock` for the entire PREPARE�
 
 #### `state_rwlock` — held briefly, twice
 
-On **P_TWOPC_PREPARE** (`drbd_state.c:918`, `787`):
+On **P_TWOPC_PREPARE**, the full call chain is:
+
 ```
-begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)
-  → write_lock_irqsave(&state_rwlock)       ← acquire
-  → ___begin_state_change(): copy NOW → NEW
-  → try_state_change(): sanitize + validate
-  → if (flags & CS_PREPARE) goto out;       ← skip apply
-  → write_unlock_irqrestore(&state_rwlock)  ← release
+begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)        ← drbd_state.c:958
+  → state_change_lock(): write_lock_irqsave(&state_rwlock)   ← ACQUIRE
+  → __begin_state_change(): copy NOW → NEW
+
+end_state_change()                                     ← drbd_state.c:981
+  → __end_state_change()                               ← drbd_state.c:964
+      → ___end_state_change()                          ← drbd_state.c:787
+          → try_state_change(): sanitize + validate
+          → if (flags & CS_PREPARE) goto out;          ← skip apply, return rv
+            (lock is still held when ___end_state_change returns)
+      → __state_change_unlock()                        ← drbd_state.c:929
+          → write_unlock_irqrestore(&state_rwlock)     ← RELEASE
 ```
 
-On **P_TWOPC_COMMIT** (`drbd_state.c:787`):
+The unlock is NOT inside `___end_state_change()`. It is in `__end_state_change()` at line 977, which calls `__state_change_unlock()` **unconditionally** after `___end_state_change()` returns — whether it took the PREPARE path or the apply path.
+
+On **P_TWOPC_COMMIT**, the same chain applies but without the early exit:
+
 ```
 begin_state_change(CS_PREPARED | CS_LOCAL_ONLY)
-  → write_lock_irqsave(&state_rwlock)       ← acquire
-  → ___begin_state_change(): copy NOW → NEW
-  → try_state_change(): validate
-  → inline NEW → NOW copy (line 827)        ← apply
-  → __clear_remote_state_change()           ← flag cleared (line 911)
-  → write_unlock_irqrestore(&state_rwlock)  ← release
+  → write_lock_irqsave(&state_rwlock)                  ← ACQUIRE
+  → __begin_state_change(): copy NOW → NEW
+
+end_state_change()
+  → __end_state_change()
+      → ___end_state_change()
+          → try_state_change(): validate
+          → inline NEW → NOW copy (line 827)            ← apply
+          → __clear_remote_state_change() (line 911)   ← remote_state_change = false
+          → queue_after_state_change_work()
+      → __state_change_unlock()
+          → write_unlock_irqrestore(&state_rwlock)      ← RELEASE
 ```
 
 `state_rwlock` is **free** between PREPARE and COMMIT.
