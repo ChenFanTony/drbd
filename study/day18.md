@@ -285,50 +285,141 @@ On receiving `P_TWOPC_COMMIT`:
 
 ---
 
-## 8. Fencing Mode — `fencing` Configuration
+## 8. Fencing — How DRBD Handles a Lost Peer
+
+### 8.1 Why Fencing Exists
+
+When a Primary loses its network connection to a peer, two situations are possible:
+- **Peer is dead** — Primary should continue serving I/O safely.
+- **Network is partitioned** — Both nodes are alive. If both act as Primary, they diverge (split-brain).
+
+Fencing is the mechanism DRBD uses to determine which situation applies and, if the peer is alive, to force it out before the local Primary continues.
+
+### 8.2 The Three Fencing Policies (`drbd.h:61`)
 
 ```bash
-grep -n "fencing\|FP_DONT_CARE\|FP_RESOURCE\|FP_STONITH\|drbd_fence_peer_err_t\|drbd_set_role\b" \
-    drbd/drbd_int.h drbd/drbd_state.c drbd/drbd_nl.c | head -20
-```
-
-### Resource-only fencing
-
-When `fencing resource-only` is configured and a disk I/O error occurs:
-```c
-// drbd_req.c: WRITE_COMPLETED_WITH_ERROR
-→ drbd_handle_failed_mirror() [or equivalent]
-    → if (disk_conf->on_io_error == EP_DETACH)
-           change_disk_state(device, D_FAILED, CS_HARD)
-           → __after_state_change(): 
-               if (resource->role[NOW] == R_PRIMARY)
-                   change_role(resource, R_SECONDARY, CS_HARD)
-                   // Demote! Primary with failed disk is unsafe.
-```
-
-### STONITH fencing
-
-```bash
-grep -n "stonith\|DRBD_FENCING_STONITH\|after_sb.*stonith\|drbd_fence_peer" \
-    drbd/drbd_state.c drbd/drbd_nl.c | head -15
-```
-
-When STONITH is configured, DRBD calls a helper script:
-```bash
-grep -n "drbd_md_set_flag\|call_helper\|fencing.*helper" drbd/drbd_nl.c | head -10
+grep -n "FP_DONT_CARE\|FP_RESOURCE\|FP_STONITH" drbd-header/linux/drbd.h
 ```
 
 ```c
-// drbd_nl.c: drbd_set_role() with fencing=stonith
-if (test_bit(STONITH_OUTDATE_SELF, &connection->flags)) {
-    // Call user-space fence-peer handler
-    // e.g., /usr/lib/drbd/crm-fence-peer.9.sh
-    drbd_kobject_uevent_env(device, AFTER_STATE_CHANGE, envp);
-    // Handler must:
-    // 1. STONITH the peer (ensure it's dead)
-    // 2. Return 0 (success) or non-zero (failed to fence)
+FP_DONT_CARE = 0,   /* no fencing — Primary continues regardless */
+FP_RESOURCE,        /* run fence-peer helper; suspend I/O during promotion if needed */
+FP_STONITH,         /* run fence-peer helper; ALSO suspend I/O on disconnect until peer confirmed dead */
+```
+
+Default is `FP_DONT_CARE`. Stored in `connection->fencing_policy` (`drbd_int.h:1095`).
+
+### 8.3 Trigger: Primary Detects Peer Disconnect (`drbd_receiver.c:9957`)
+
+```bash
+grep -n "conn_try_outdate_peer_async\b" drbd/drbd_receiver.c
+```
+
+When the receiver thread closes a connection:
+```c
+if (resource->role[NOW] == R_PRIMARY &&
+    connection->fencing_policy != FP_DONT_CARE &&
+    conn_highest_pdsk(connection) >= D_UNKNOWN)
+    conn_try_outdate_peer_async(connection);
+```
+
+Fires for both `FP_RESOURCE` and `FP_STONITH` when peer disk status is unknown (peer may be alive).
+
+### 8.4 Async Fencing Thread (`drbd_nl.c:900`)
+
+```bash
+grep -n "conn_try_outdate_peer_async\b\|_try_outdate_peer_async\b" drbd/drbd_nl.c
+```
+
+`conn_try_outdate_peer_async()` spawns a kernel thread (`drbd_async_h`) so fencing does not block the receiver thread:
+```c
+opa = kthread_run(_try_outdate_peer_async, connection, "drbd_async_h");
+```
+
+The thread calls `conn_try_outdate_peer()` (`drbd_nl.c:786`).
+
+### 8.5 `conn_try_outdate_peer()` — The Core Fencing Logic (`drbd_nl.c:786`)
+
+```bash
+grep -n -A 100 "^static bool conn_try_outdate_peer\b" drbd/drbd_nl.c | head -100
+```
+
+Step by step:
+
+```
+1. Check local disk state (under state_rwlock):
+   if conn_highest_disk(connection) < D_CONSISTENT:
+       clear susp_fen, return   ← we don't have good data either, nothing to fence for
+
+2. Run user-space helper:
+   r = drbd_maybe_khelper(NULL, connection, "fence-peer")
+   (e.g. /usr/lib/drbd/crm-fence-peer.9.sh)
+
+3. Interpret exit code ((r>>8) & 0xff):
+```
+
+| Exit code | Constant | Meaning | Action |
+|---|---|---|---|
+| 1 | `P_INCONSISTENT` | Peer is inconsistent | Downgrade peer disk to `D_INCONSISTENT` |
+| 3 | `P_OUTDATED` | Peer was fenced/outdated | Downgrade peer disk to `D_OUTDATED` |
+| 4 | `P_DOWN` | Peer unreachable/dead | If our disk is `D_UP_TO_DATE`: downgrade peer to `D_OUTDATED` |
+| 5 | `P_PRIMARY` | Peer is still primary | Outdate **ourselves** to `D_OUTDATED` (voluntary demotion) |
+| 7 | `P_FENCING` | Peer was STONITH'd | Downgrade peer disk to `D_OUTDATED` |
+
+```
+4. Safety check: if peer reconnected while helper was running → abort_state_change()
+   (connection is already fine, no fencing needed)
+```
+
+### 8.6 I/O Suspension for FP_STONITH
+
+For `FP_STONITH` only, `sanitize_state()` suspends I/O automatically when the peer disconnects (`drbd_state.c:2138`):
+
+```c
+if (connection->fencing_policy == FP_STONITH &&
+    role[NEW] == R_PRIMARY &&
+    repl_state[NEW] < L_ESTABLISHED &&
+    peer_disk_state[NEW] == D_UNKNOWN)
+    connection->susp_fen[NEW] = true;   /* suspend I/O */
+```
+
+I/O stays suspended until `check_may_resume_io_after_fencing()` (`drbd_state.c:3658`) clears it. This happens when either:
+
+| Condition | Action |
+|---|---|
+| All peer disks are `D_OUTDATED` or below | Generate new UUID, clear `susp_fen` → resume I/O |
+| Peer reconnected (`repl_state >= L_ESTABLISHED`) | Clear `susp_fen` → resume I/O |
+
+For `FP_RESOURCE`, I/O is **not** suspended on disconnect. Fencing only runs the helper to update peer disk state in metadata and is primarily enforced during promotion attempts.
+
+### 8.7 Fencing During Promotion (`drbd_nl.c:1103`)
+
+When `drbdadm primary` fails with `SS_NO_UP_TO_DATE_DISK` (our disk is only `D_CONSISTENT`, not `D_UP_TO_DATE`):
+
+```c
+/* drbd_nl.c:1103 */
+for_each_connection_ref(connection, im, resource) {
+    if (conn_try_outdate_peer(connection, tag))
+        fenced_peers = true;
+}
+if (fenced_peers && !any_fencing_failed) {
+    flags |= CS_FP_LOCAL_UP_TO_DATE;
+    continue;   /* retry promotion — now allowed */
 }
 ```
+
+If fencing succeeds (peer confirmed outdated), DRBD promotes itself. If fencing fails and `--force` is not used, promotion is refused.
+
+### 8.8 Unfencing (`drbd_state.c:4366`)
+
+When the peer reconnects and both sides are `D_UP_TO_DATE`, DRBD calls the `unfence-peer` helper:
+
+```c
+if (fencing_policy != FP_DONT_CARE && drbd_should_unfence(state_change, n_connection))
+    drbd_maybe_khelper(NULL, connection, "unfence-peer");
+```
+
+`drbd_should_unfence()` (`drbd_state.c:3714`) returns true only when all volumes have both local and peer disk at `D_UP_TO_DATE`.
 
 ---
 
