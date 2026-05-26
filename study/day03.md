@@ -173,27 +173,103 @@ drbdadm primary r0
 
 ---
 
-## 4. `sanitize_state()` — Automatic State Adjustments
-
-This function enforces invariants. If a caller sets an impossible combination, sanitize adjusts it:
+## 4. `sanitize_state()` — Automatic State Adjustments (`drbd_state.c:1996`)
 
 ```bash
-grep -n -A 80 "^static void sanitize_state\b" drbd/drbd_state.c
+grep -n "^static void sanitize_state\b" drbd/drbd_state.c
 ```
 
-Examples of invariants enforced:
+`sanitize_state()` runs **after** a caller sets `[NEW]` fields and **before** `is_valid_transition()` checks them. Its job is to look at all `[NEW]` fields together and **fix up any inconsistent or impossible combinations** — correcting what the caller set incompletely or incorrectly. It only touches `[NEW]` fields, never `[NOW]`.
+
+The caller only sets what it intends to change. `sanitize_state()` derives everything else that must logically follow.
+
+### What it actually fixes
+
+**1. Peer role reset when connection drops (line 2012)**
 ```c
-// If disk goes Failed, replication cannot be Established
-if (disk_state[NEW] == D_FAILED && repl_state[NEW] == L_ESTABLISHED)
-    repl_state[NEW] = L_OFF;
+if (cstate[NEW] < C_CONNECTED)
+    connection->peer_role[NEW] = R_UNKNOWN;
+```
+If the connection falls below `C_CONNECTED`, the peer's role is unknown — force it to `R_UNKNOWN` regardless of what the caller set.
 
-// If we're Primary and disk becomes Diskless, must fence
-if (role[NEW] == R_PRIMARY && disk_state[NEW] == D_DISKLESS)
-    set_bit(FORCE_DETACH, &device->flags);
+**2. Impossible disk-state transition (line 2031)**
+```c
+if (disk_state[OLD] == D_DISKLESS && disk_state[NEW] == D_DETACHING)
+    disk_state[NEW] = D_DISKLESS;
+```
+Cannot detach what was never attached.
 
-// A diskless node cannot be UpToDate
-if (disk_state[NEW] == D_DISKLESS && ...)
-    disk_state[NEW] = D_DISKLESS; // already is, just ensure consistent
+**3. D_NEGOTIATING resolution (lines 2038–2097)**
+
+When a node enters `D_NEGOTIATING` (initial handshake with peers), `sanitize_state()` collects negotiation results from all connected peers and resolves the final disk state:
+
+| Negotiation result | Resolved `disk_state[NEW]` |
+|---|---|
+| All peers returned `NEG_NO_RESULT` | `D_DETACHING` |
+| Any peer wants us as sync target | `D_INCONSISTENT` |
+| Peer with `D_UP_TO_DATE` exists | `D_UP_TO_DATE` |
+| Otherwise | `disk_state_from_md()` (from metadata) |
+
+**4. Peer disk state reset when replication drops (line 2112)**
+```c
+if (repl_state[NEW] < L_ESTABLISHED) {
+    peer_device->resync_susp_peer[NEW] = false;
+    if (peer_disk_state[NEW] > D_UNKNOWN || peer_disk_state[NEW] < D_INCONSISTENT)
+        peer_disk_state[NEW] = D_UNKNOWN;
+}
+```
+Below `L_ESTABLISHED` we can no longer know the peer's disk state.
+
+**5. Abort resync if any disk fails (line 2130)**
+```c
+if (repl_state[NEW] > L_ESTABLISHED &&
+    (disk_state[NEW] <= D_FAILED || peer_disk_state[NEW] <= D_FAILED)) {
+    repl_state[NEW] = L_ESTABLISHED;
+    peer_device->resync_active[NEW] = false;
+}
+```
+If local or peer disk just failed, resync is impossible — force `repl_state` back to `L_ESTABLISHED`.
+
+**6. STONITH fencing I/O suspend (line 2138)**
+```c
+if (connection->fencing_policy == FP_STONITH &&
+    role[NEW] == R_PRIMARY &&
+    repl_state[NEW] < L_ESTABLISHED &&
+    peer_disk_state[NEW] == D_UNKNOWN)
+    connection->susp_fen[NEW] = true;
+```
+Primary loses contact with peer and fencing is STONITH — suspend I/O until the peer is confirmed dead.
+
+**7. Disk state bounds implied by replication state (lines 2186–2251)**
+
+For each `repl_state[NEW]`, valid `disk_state` and `peer_disk_state` ranges are defined. If `[NEW]` is outside the range, it is clamped silently:
+
+| `repl_state[NEW]` | local disk | peer disk |
+|---|---|---|
+| `L_SYNC_TARGET` / `L_PAUSED_SYNC_T` | exactly `D_INCONSISTENT` | `D_INCONSISTENT`..`D_UP_TO_DATE` |
+| `L_SYNC_SOURCE` | `D_INCONSISTENT`..`D_UP_TO_DATE` | exactly `D_INCONSISTENT` |
+| `L_ESTABLISHED` | `D_DISKLESS`..`D_UP_TO_DATE` | `D_DISKLESS`..`D_UP_TO_DATE` |
+| `L_BEHIND` / `L_WF_BITMAP_T` | `D_INCONSISTENT`..`D_OUTDATED` | `D_INCONSISTENT`..`D_UP_TO_DATE` |
+| `L_OFF` | `D_DISKLESS`..`D_UP_TO_DATE` | `D_INCONSISTENT`..`D_UNKNOWN` |
+
+**8. D_OUTDATED upgrade opportunities (lines 2260–2289)**
+
+Several conditions automatically promote `D_OUTDATED → D_UP_TO_DATE` in `[NEW]`:
+- Just connected to a stable peer with a matching UUID and no resync needed
+- Peer just became stable (UUID_FLAG_GOT_STABLE)
+- Connected peer upgraded from `D_CONSISTENT` to `D_UP_TO_DATE` with matching UUID
+
+**9. Quorum recalculation and I/O suspension (lines 2337–2375)**
+```c
+device->have_quorum[NEW] = calc_quorum(device, NULL);
+
+/* Primary with no accessible data → suspend I/O */
+if (role[NEW] == R_PRIMARY && !drbd_data_accessible(device, NEW))
+    resource->susp_nod[NEW] = true;
+
+/* No quorum and policy is suspend → suspend I/O */
+resource->susp_quorum[NEW] =
+    (on_no_quorum == ONQ_SUSPEND_IO) ? !resource_has_quorum : false;
 ```
 
 ---
