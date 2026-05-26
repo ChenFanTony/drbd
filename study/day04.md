@@ -364,18 +364,73 @@ day22 Section 8 for the full treatment.
 ## 9. The Transfer Log and Write Ordering
 
 ```bash
-grep -n "transfer_log\|dagtag\|tl_requests" drbd/drbd_req.c drbd/drbd_receiver.c | head -20
+grep -n "transfer_log\|tl_update_lock\|tl_requests\|dagtag_sector" drbd/drbd_req.c drbd/drbd_sender.c | head -30
 ```
 
-The `resource->transfer_log` is an ordered list of all in-flight `drbd_request` objects, sorted by `dagtag`. Its purpose:
+`resource->transfer_log` is a linked list of all in-flight `drbd_request` objects. It is the mechanism by which DRBD enforces identical write ordering on both the local disk and all peer nodes.
 
-1. **Write ordering on secondaries:** The secondary processes writes in dagtag order. If write B (dagtag=5) arrives before write A (dagtag=4) on the secondary, the secondary buffers B until A is processed.
+### 9.1 Why ordering matters
 
-2. **Recovery after disconnect:** If a peer disconnects, DRBD walks the transfer log to mark all in-flight writes as OOS in the bitmap (those writes could not be replicated).
+The Linux block layer I/O scheduler reorders writes before submission (sorting by LBA, merging adjacent requests, etc.) to improve throughput. By the time the block layer calls `drbd_make_request()`, it has already chosen a submission order. DRBD's job is to ensure both the local disk and every peer see writes in **that same order** — not some random order determined by network or disk latency.
+
+### 9.2 Step 1 — dagtag assignment and list insertion are serialized (`drbd_req.c:1988`)
 
 ```bash
-# Where the transfer log is walked on disconnect:
-grep -n "transfer_log\|tl_walk\|tl_restart" drbd/drbd_req.c drbd/drbd_main.c | head -20
+grep -n "tl_update_lock\|dagtag_sector\|list_add_tail_rcu.*tl_requests" drbd/drbd_req.c
+```
+
+```c
+spin_lock(&resource->tl_update_lock);   /* serializes all drbd_make_request() calls */
+    resource->dagtag_sector += req->i.size >> 9;   /* monotonically increasing */
+    req->dagtag_sector = resource->dagtag_sector;
+    ...
+    list_add_tail_rcu(&req->tl_requests, &resource->transfer_log);
+spin_unlock(&resource->tl_update_lock);
+```
+
+`tl_update_lock` ensures every write gets a unique, strictly increasing dagtag and is appended to the **tail** of the transfer log. The list is always in submission order.
+
+### 9.3 Step 2 — the sender never skips a pending request (`drbd_sender.c:3248`)
+
+```bash
+grep -n -A 20 "^static struct drbd_request \*__next_request_for_connection" drbd/drbd_sender.c
+```
+
+```c
+static struct drbd_request *__next_request_for_connection(struct drbd_connection *connection)
+{
+    list_for_each_entry_rcu(req, &resource->transfer_log, tl_requests) {
+        unsigned s = req->net_rq_state[connection->peer_node_id];
+
+        /* Pending but not yet queued: STOP — do not skip over it */
+        if (unlikely(s & RQ_NET_PENDING && !(s & (RQ_NET_QUEUED|RQ_NET_SENT))))
+            return NULL;   /* sender goes back to sleep */
+
+        if (s & RQ_NET_QUEUED)
+            return req;    /* ready: send this one next */
+    }
+    return NULL;
+}
+```
+
+The critical line is `return NULL` — the sender **stops and sleeps** if it encounters a request that needs to go to the network but is not yet queued. It never jumps over request N to send request N+1. The peer therefore always receives `P_DATA` packets in list order — which is dagtag order — which is submission order.
+
+### 9.4 Local disk completion order does not affect send order
+
+The sender walks the transfer log by **list position**, not by local disk completion. The local disk may complete write N+1 before write N (elevator reordering inside the backing device), but that does not move any request's position in the transfer log. The network path and the local disk path are completely independent in terms of ordering.
+
+### 9.5 Single-primary vs dual-primary
+
+In **single-primary** mode: ordering is fully enforced by the sender (steps above). The receiver processes `P_DATA` packets as they arrive — in order — with no extra buffering needed.
+
+In **dual-primary** mode: two primaries send independently to each other. Each primary maintains its own transfer log and dagtag space, so `P_DATA` streams from A→B and B→A are independent. The receiver uses `wait_for_and_update_peer_seq()` (`drbd_receiver.c:2903`) to detect and resolve conflicts between concurrent writes from both primaries — this only runs when `RESOLVE_CONFLICTS` is set.
+
+### 9.6 Second purpose: recovery after disconnect
+
+When a peer disconnects, DRBD walks the transfer log to find all requests that have `RQ_NET_PENDING` set for that peer (i.e., sent but not yet acknowledged, or not yet sent). Those sectors are marked out-of-sync in the peer's bitmap so they will be resynced on reconnect.
+
+```bash
+grep -n "RQ_NET_PENDING\|set_bit.*OUT_OF_SYNC\|drbd_set_out_of_sync" drbd/drbd_req.c | head -15
 ```
 
 ---
