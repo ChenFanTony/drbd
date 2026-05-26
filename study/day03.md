@@ -533,52 +533,74 @@ drbd_maybe_cluster_wide_reply(resource);  // wake initiator if all replied
 
 `cluster_wide_reply_ready()` (`drbd_state.c:4555`) scans all connections with `TWOPC_PREPARED` set and returns `true` when all have replied YES, or any has replied NO/RETRY.
 
-### 10.6 Locking on the Participant During TWOPC
+### 10.6 Locking During TWOPC (Initiator and Participant)
 
-A key question: does the participant hold `state_rwlock` for the entire PREPARE→COMMIT window?
+**No node holds `state_rwlock` across the network transfer.** It is a spinlock and cannot sleep. Instead DRBD releases it before sending packets and re-acquires it after replies arrive. Two separate mechanisms cover the gap.
 
-**No.** `state_rwlock` is a spinlock — it cannot sleep, so it cannot be held across a network round-trip. Instead, DRBD uses two separate mechanisms with different scopes.
-
-#### `state_rwlock` — held briefly, twice
-
-On **P_TWOPC_PREPARE**, the full call chain is:
+#### Initiator: `change_cluster_wide_state()` (`drbd_state.c:4929`)
 
 ```
-begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)        ← drbd_state.c:958
-  → state_change_lock(): write_lock_irqsave(&state_rwlock)   ← ACQUIRE
+begin_state_change()                                  ← drbd_state.c:4944
+  → write_lock_irqsave(&state_rwlock)                 ← ACQUIRE
   → __begin_state_change(): copy NOW → NEW
+  → change(PH_PREPARE) + try_state_change()           ← local validate
 
-end_state_change()                                     ← drbd_state.c:981
-  → __end_state_change()                               ← drbd_state.c:964
-      → ___end_state_change()                          ← drbd_state.c:787
-          → try_state_change(): sanitize + validate
-          → if (flags & CS_PREPARE) goto out;          ← skip apply, return rv
-            (lock is still held when ___end_state_change returns)
-      → __state_change_unlock()                        ← drbd_state.c:929
-          → write_unlock_irqrestore(&state_rwlock)     ← RELEASE
+begin_remote_state_change()                           ← drbd_state.c:5077
+  → rcu_read_unlock()
+  → write_unlock_irqrestore(&state_rwlock)            ← RELEASE
+
+  [state_rwlock FREE — can block/sleep]
+  __cluster_wide_request()                            ← send P_TWOPC_PREPARE
+  wait_event_interruptible_timeout()                  ← wait for YES/NO votes
+
+end_remote_state_change()                             ← drbd_state.c:5223
+  → write_lock_irqsave(&state_rwlock)                 ← RE-ACQUIRE
+  → ___begin_state_change(): reset [NEW] from [NOW]
+
+end_state_change()                                    ← drbd_state.c:5227
+  → __end_state_change()
+      → ___end_state_change(): apply [NEW]→[NOW]
+      → __state_change_unlock()
+          → write_unlock_irqrestore(&state_rwlock)    ← RELEASE
 ```
 
-The unlock is NOT inside `___end_state_change()`. It is in `__end_state_change()` at line 977, which calls `__state_change_unlock()` **unconditionally** after `___end_state_change()` returns — whether it took the PREPARE path or the apply path.
+#### Participant: `process_twopc()` — two separate lock windows
 
-On **P_TWOPC_COMMIT**, the same chain applies but without the early exit:
-
+On **P_TWOPC_PREPARE**:
 ```
-begin_state_change(CS_PREPARED | CS_LOCAL_ONLY)
-  → write_lock_irqsave(&state_rwlock)                  ← ACQUIRE
+begin_state_change(CS_PREPARE | CS_LOCAL_ONLY)
+  → write_lock_irqsave(&state_rwlock)                 ← ACQUIRE
   → __begin_state_change(): copy NOW → NEW
 
 end_state_change()
   → __end_state_change()
       → ___end_state_change()
-          → try_state_change(): validate
-          → inline NEW → NOW copy (line 827)            ← apply
-          → __clear_remote_state_change() (line 911)   ← remote_state_change = false
-          → queue_after_state_change_work()
-      → __state_change_unlock()
-          → write_unlock_irqrestore(&state_rwlock)      ← RELEASE
+          → try_state_change(): sanitize + validate
+          → if (flags & CS_PREPARE) goto out;         ← skip apply
+            (lock still held when ___end_state_change returns)
+      → __state_change_unlock()                       ← drbd_state.c:929
+          → write_unlock_irqrestore(&state_rwlock)    ← RELEASE
 ```
 
-`state_rwlock` is **free** between PREPARE and COMMIT.
+The unlock is in `__end_state_change()` at line 977, calling `__state_change_unlock()` **unconditionally** after `___end_state_change()` returns.
+
+On **P_TWOPC_COMMIT**:
+```
+begin_state_change(CS_PREPARED | CS_LOCAL_ONLY)
+  → write_lock_irqsave(&state_rwlock)                 ← ACQUIRE
+
+end_state_change()
+  → __end_state_change()
+      → ___end_state_change()
+          → try_state_change(): validate
+          → inline NEW → NOW copy (line 827)           ← apply
+          → __clear_remote_state_change() (line 911)  ← remote_state_change = false
+          → queue_after_state_change_work()
+      → __state_change_unlock()
+          → write_unlock_irqrestore(&state_rwlock)    ← RELEASE
+```
+
+`state_rwlock` is **free** between PREPARE and COMMIT on both initiator and participant.
 
 #### `resource->remote_state_change` — held for the full PREPARE→COMMIT window
 
