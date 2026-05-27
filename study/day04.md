@@ -222,12 +222,83 @@ Then `__req_mod()` clears `RQ_LOCAL_PENDING`, sets `RQ_LOCAL_OK`, and calls `drb
 
 This is the most important function in `drbd_req.c`. It drives the state machine for each request. **Note:** The actual mechanism in DRBD 9.2 uses `mod_rq_state()` and `req_mod()` together, with completion driven by `req->completion_ref` (an atomic counter) rather than by checking individual bits.
 
-```bash
-grep -n "^void __req_mod\|^void req_mod\|^static void mod_rq_state" drbd/drbd_req.c | head -10
-grep -n -A 100 "^static void mod_rq_state\b" drbd/drbd_req.c
+### 6.1 Caller Wrappers
+
+Three wrappers exist with different locking contracts:
+
+```
+__req_mod()   ← raw; caller already holds state_rwlock or is in irq context
+_req_mod()    ← calls __req_mod then complete_master_bio() outside any lock
+req_mod()     ← acquires read_lock_irq(state_rwlock), calls __req_mod, then complete_master_bio()
 ```
 
-The pattern (simplified):
+`req_mod()` (`drbd_req.h:319`) is used by the ack receiver thread; `_req_mod()` is used inside
+sections that already hold the transfer-log spinlock; `__req_mod()` is used directly in bio endio
+and sender paths that save/restore irq flags themselves.
+
+### 6.2 Call Sites by Lifecycle Phase
+
+#### Phase 1 — Request setup (`drbd_req.c`, inside `tl_update_lock`)
+
+| Event | Line | Meaning |
+|---|---|---|
+| `TO_BE_SUBMITTED` | `drbd_req.c:2068` | About to submit bio to local disk |
+| `NEW_NET_WRITE` | `drbd_req.c:1690` | Write queued for network send |
+| `NEW_NET_READ` | `drbd_req.c:2029` | Read routed to remote peer |
+| `NEW_NET_OOS` | `drbd_req.c:1692` | No live connection — will send P_OUT_OF_SYNC instead |
+| `ADDED_TO_TRANSFER_LOG` | `drbd_req.c:1705` | Request enqueued to sender thread |
+| `BARRIER_SENT` | `drbd_req.c:1663` | Empty flush — mark barrier sent to peer |
+
+#### Phase 2 — Local disk completion (`drbd_sender.c:359`, bio endio callback)
+
+Called from the bio completion handler. Uses `__req_mod` directly (not `_req_mod`) because
+irq flags are already saved with `read_lock_irqsave`.
+
+| Event | Condition |
+|---|---|
+| `COMPLETED_OK` | disk read/write succeeded |
+| `WRITE_COMPLETED_WITH_ERROR` | disk write failed |
+| `READ_COMPLETED_WITH_ERROR` | disk read failed |
+| `READ_AHEAD_COMPLETED_WITH_ERROR` | readahead failed (non-fatal to upper layer) |
+| `DISCARD_COMPLETED_NOTSUPP` / `DISCARD_COMPLETED_WITH_ERROR` | discard failed |
+
+#### Phase 3 — Network send completion (`drbd_sender.c:3588`, after `drbd_send_dblock()`)
+
+Sender thread calls `__req_mod` under `read_lock_irq(state_rwlock)` after each send attempt:
+
+| Event | Condition |
+|---|---|
+| `HANDED_OVER_TO_NETWORK` | data packet sent successfully |
+| `SEND_FAILED` | send returned error |
+| `OOS_HANDED_TO_NETWORK` | `P_OUT_OF_SYNC` sent to peer |
+| `SEND_CANCELED` | `drbd_sender.c:3701` — connection dropped while request was queued |
+
+#### Phase 4 — Network ACK reception (`drbd_receiver.c` via `validate_req_change_req_state()`)
+
+Ack receiver thread calls `req_mod()` (locking wrapper) when reply packets arrive. The request
+is found by sector address in the interval tree, then driven forward:
+
+| Packet received | Event passed to `__req_mod` |
+|---|---|
+| `P_WRITE_ACK` | `WRITE_ACKED_BY_PEER` — Protocol C write confirmed durable on peer |
+| `P_WRITE_ACK_IN_SYNC` | `WRITE_ACKED_BY_PEER_AND_SIS` — durable + cleared from OOS bitmap |
+| `P_RECV_ACK` | `RECV_ACKED_BY_PEER` — Protocol B: peer received data |
+| `P_NEG_ACK` | `NEG_ACKED` — peer rejected or lost the write |
+| (read reply data) | `DATA_RECEIVED` — remote read data received (`drbd_receiver.c:2646`) |
+
+#### Phase 5 — Barrier acknowledgment (`drbd_main.c:448`, in `tl_release()`)
+
+`tl_release()` is called when `P_BARRIER_ACK` arrives. It walks the matching epoch in the
+transfer log and calls `req_mod(req, BARRIER_ACKED, ...)` for every request in that epoch.
+This is the Protocol A durability point — the peer confirms all preceding writes are stable.
+
+#### Phase 6 — Connection loss (`drbd_main.c:501`, via `__tl_walk()`)
+
+On disconnect, DRBD walks the entire transfer log and applies `CONNECTION_LOST` or
+`CONNECTION_LOST_WHILE_SUSPENDED` to every request still holding `RQ_NET_PENDING`. This
+drives OOS bitmap marking for all in-flight writes that never reached the peer.
+
+### 6.3 State machine pattern (simplified)
 
 ```c
 void __req_mod(struct drbd_request *req, enum drbd_req_event what,
