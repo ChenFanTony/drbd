@@ -301,40 +301,93 @@ When the sender thread dequeues this work item, it calls `drbd_send_dblock()`.
 
 ## 8. Epochs and Barriers — Write Ordering on the Secondary
 
-Every write belongs to an **epoch**. An epoch boundary is triggered by a `REQ_PREFLUSH` / `REQ_FUA` flag or when the application issues an explicit fsync.
+### 8.1 Why epochs exist — not the same job as the transfer log
 
-```bash
-grep -n "struct drbd_epoch {" drbd/drbd_int.h
+The transfer log and epochs solve **different problems**:
+
+- **Transfer log**: ensures the sender thread sends writes in dagtag sequence (initiator-side ordering). It is a local in-memory structure and says nothing about durability at the peer.
+- **Epochs**: answer the question *how does the initiator know writes are durably stored on the peer?*
+
+For **Protocol C/B**, every write gets an individual `P_WRITE_ACK` / `P_RECV_ACK`, so each request knows independently when it is done. Epochs matter less there.
+
+For **Protocol A**, there is **no per-write acknowledgment**. The only durability signal is `P_BARRIER_ACK`. Epochs are the grouping mechanism: when the peer sends `P_BARRIER_ACK`, every write in that epoch is confirmed on stable storage. Without epochs, a `P_BARRIER_ACK` has no defined scope.
+
+`__req_mod()` for `BARRIER_ACKED` (`drbd_req.c:1322`) shows this:
+```c
+case BARRIER_ACKED:
+    /* As this is called for all requests within a matching epoch,
+     * we need to filter, and only set RQ_NET_DONE for those that
+     * have actually been on the wire. */
+    if (req->net_rq_state[idx] & RQ_NET_MASK)
+        mod_rq_state(req, m, peer_device, 0, RQ_NET_DONE);
 ```
+`tl_release()` walks all requests in the epoch and fires `BARRIER_ACKED` on each — the **only** completion path for Protocol A writes.
+
+### 8.2 Epoch structure (`drbd_int.h:419`)
 
 ```c
 struct drbd_epoch {
     struct drbd_connection *connection;
     struct list_head list;          // node in connection->epochs
     unsigned int barrier_nr;        // sequence number
-    atomic_t epoch_size;            // writes in this epoch
-    atomic_t active;                // writes not yet ACKed
+    atomic_t epoch_size;            // writes added to this epoch
+    atomic_t active;                // writes not yet completed on peer disk
+    atomic_t confirmed;             // adjusted for P_CONFIRM_STABLE
     unsigned long flags;            // DE_BARRIER_IN_NEXT_EPOCH_ISSUED, etc.
 };
 ```
 
-When a flush/barrier arrives from the application:
+### 8.3 When a new epoch starts
+
+`start_new_tl_epoch()` (`drbd_req.c:388`) increments `resource->current_tle_nr` and wakes
+the sender. It is called from two places:
+
+- `drbd_req.c:606` — `REQ_PREFLUSH` / `REQ_FUA` / `blkdev_issue_flush()` arrives; the
+  flush becomes an epoch boundary
+- `drbd_req.c:1184` — `current_tle_writes >= max_epoch_size` (flow control)
+
+### 8.4 Sender: detecting the boundary (`drbd_sender.c:3444`)
 
 ```c
-// drbd_sender.c
-drbd_send_barrier(connection)
-    → struct p_barrier p
-    → p.barrier = epoch->barrier_nr
-    → drbd_send_command(connection, CONTROL_STREAM, P_BARRIER, ...)
-    // Sent over META socket (not data socket)
+static bool should_send_barrier(struct drbd_connection *connection, unsigned int epoch)
+{
+    if (!connection->send.seen_any_write_yet)
+        return false;
+    return connection->send.current_epoch_nr != epoch;
+}
+static void maybe_send_barrier(struct drbd_connection *connection, unsigned int epoch)
+{
+    if (should_send_barrier(connection, epoch)) {
+        if (connection->send.current_epoch_writes)
+            drbd_send_barrier(connection);       // sends P_BARRIER on CONTROL_STREAM
+        connection->send.current_epoch_nr = epoch;
+    }
+}
 ```
+Before sending a data packet, the sender calls `maybe_send_barrier()`. If the request's
+epoch number has advanced, `P_BARRIER` is sent first.
 
-On the secondary, `receive_Barrier()` in `drbd_receiver.c`:
-```bash
-grep -n -A 40 "^static int receive_Barrier\b" drbd/drbd_receiver.c
-```
-- Opens a new epoch
-- When all writes in the closed epoch complete on local disk → sends `P_BARRIER_ACK`
+### 8.5 Receiver: `receive_Barrier()` (`drbd_receiver.c:1945`)
+
+On the secondary, receiving `P_BARRIER`:
+1. Assigns the barrier number to the current epoch object
+2. Depending on `write_ordering` mode:
+   - `WO_BDEV_FLUSH` / `WO_DRAIN_IO`: drains all active peer requests and issues a disk flush before sending `P_BARRIER_ACK`
+   - `WO_BIO_BARRIER` / `WO_NONE`: recycles epoch immediately
+3. Allocates a new `drbd_epoch` for incoming writes after this barrier
+
+### 8.6 Flow control via `max_epoch_size`
+
+When `current_tle_writes >= max_epoch_size`, `start_new_tl_epoch()` forces a new epoch
+(`drbd_req.c:1184`). This bounds outstanding writes before the peer must flush, limiting
+memory pressure on both sides. `max_epoch_size` is configurable per connection.
+
+### 8.7 Summary
+
+| Mechanism | Scope | Solves |
+|---|---|---|
+| Transfer log | Initiator sender thread | Write send ordering (dagtag sequence) |
+| Epochs | Network round-trip | Protocol A bulk durability ack + peer disk flush ordering + flow control |
 
 ---
 
