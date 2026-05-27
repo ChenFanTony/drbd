@@ -230,6 +230,88 @@ grep -n -A 60 "^static int receive_bitmap\b" drbd/drbd_receiver.c
 
 Both sides OR their bitmaps together: `local_bm |= peer_bm`. The result is the union of OOS bits — every block that either side thinks is OOS will be resynced.
 
+### 5.1 How the bitmap send is serialized with concurrent I/O
+
+The bitmap is a one-time snapshot. To take a consistent snapshot, DRBD **freezes application I/O** for the duration of the send using the `ap_bio_cnt` + `pending_bitmap_work` mechanism.
+
+`drbd_queue_bitmap_io()` (`drbd_main.c:5983`) is called to schedule the send:
+
+```c
+atomic_inc(&device->ap_bio_cnt[WRITE]);      // hold a fake "I/O in flight" ref
+atomic_inc(&device->pending_bitmap_work.n);  // signal: bitmap work is pending
+list_add_tail(bm_io_work, &device->pending_bitmap_work.q);
+dec_ap_bio(device, WRITE);                   // release fake ref → may trigger execution
+```
+
+New I/O is blocked immediately. `may_inc_ap_bio()` (`drbd_int.h:2839`) returns false when
+`pending_bitmap_work.n > 0`, so no new application write can start. Existing in-flight
+writes keep running and decrement `ap_bio_cnt` normally. When the last one finishes and
+`ap_bio_cnt` drops to 0, `dec_ap_bio()` fires `drbd_queue_pending_bitmap_work()` which
+moves the bitmap send to the resource work queue.
+
+Result: `drbd_send_bitmap()` runs only when all in-flight writes have completed, and no new
+write can start while it is running. No concurrent bitmap update is possible.
+
+### 5.2 After the bitmap is sent — I/O resumes without a re-send
+
+Once the bitmap send completes, the state transitions to `L_SYNC_SOURCE` and
+`pending_bitmap_work.n` drops to 0. New I/O is unblocked. **The bitmap is never re-sent.**
+
+New writes during resync are handled by `drbd_should_do_remote()` (`drbd_req.c:1510`):
+
+```c
+return peer_disk_state == D_UP_TO_DATE ||
+    (peer_disk_state == D_INCONSISTENT &&
+     (repl_state == L_ESTABLISHED ||
+      (repl_state >= L_WF_BITMAP_T && repl_state < L_AHEAD)));
+```
+
+`L_SYNC_SOURCE >= L_WF_BITMAP_T` → true. Writes during resync go through the **normal
+P_DATA replication path**, not through OOS marking.
+
+### 5.3 Resync vs. concurrent write conflict
+
+The resync scanner (`drbd_bm_find_next()` in `drbd_sender.c:1258`) runs concurrently with
+normal write replication. This creates a race: the resync might send stale data
+(`P_RS_DATA_REPLY`) for a block that a newer application write (`P_DATA`) just updated at
+the peer.
+
+DRBD resolves this at the **SyncTarget** (peer) side: when a `P_DATA` write arrives for a
+block that also has a resync write in the interval tree, the receiver calls
+`drbd_cancel_conflicting_resync_requests()` (`drbd_sender.c:9433`). It finds the
+`INTERVAL_RESYNC_WRITE` entry and cancels it — the stale resync data is discarded. Only
+the newer application write is applied.
+
+```
+New write (block X) ──────▶ P_DATA ──────────────────────▶ peer applies it
+                                                             ↑
+Resync finds block X set ──▶ P_RS_DATA_REPLY ──▶ peer: conflict detected
+                                                  → cancel resync write (stale)
+                                                  → P_DATA wins
+```
+
+### 5.4 What about writes during L_WF_BITMAP_S (before freeze)?
+
+`drbd_should_send_out_of_sync()` (`drbd_req.c:1524`) returns true for `L_WF_BITMAP_S`:
+
+```c
+return repl_state == L_AHEAD ||
+       repl_state == L_WF_BITMAP_S || ...
+```
+
+Any write that was already in flight when the state entered `L_WF_BITMAP_S` (before the
+`ap_bio_cnt` gate closes) is sent as `P_OUT_OF_SYNC` — not replicated, just recorded as
+OOS on the peer. The bitmap exchange that follows captures all OOS regions, and resync
+covers them.
+
+### 5.5 Summary
+
+| Phase | New writes | Bitmap |
+|---|---|---|
+| `L_WF_BITMAP_S` | Blocked (or sent as P_OUT_OF_SYNC if already in flight) | Being sent — snapshot frozen |
+| `L_SYNC_SOURCE` | Replicated normally via P_DATA | Fixed; resync uses it |
+| Resync + write conflict | P_DATA wins; resync write canceled at peer | OOS bit cleared when resync acks |
+
 ---
 
 ## 6. Disconnect and Reconnect
