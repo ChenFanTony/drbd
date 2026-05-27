@@ -385,7 +385,92 @@ grep -n "al_extents\|DRBD_AL_EXTENTS\|al_ext_needed" drbd/drbd_nl.c drbd/drbd_in
 
 ---
 
-## 10. Hands-On Exercises (3–4 hours)
+## 10. AL vs Bitmap at Crash Recovery: Which Wins?
+
+Both AL and bitmap are persisted to the metadata device, but they have fundamentally different durability guarantees. Understanding which is authoritative — and in what order they are applied — is key to understanding DRBD's recovery guarantee.
+
+### 10.1 Durability asymmetry
+
+| Structure | Write timing | Durability |
+|---|---|---|
+| Activity Log | Written **before** any data write (`REQ_PREFLUSH \| REQ_FUA`) | **Always accurate** — if a write started, the AL was updated first |
+| Bitmap | Written **lazily** — on disconnect, resync progress, or `drbd_bm_write()` | **Can be stale** — a crash mid-write may leave bitmap missing recently-set bits |
+
+The AL is the conservative record: if an extent was being written, the AL slot was reserved *before* the write hit the disk. A crash cannot cause the AL to miss an in-flight extent. The bitmap has no such guarantee.
+
+### 10.2 The merge: `drbdadm apply-al` (userspace)
+
+Kernel does **not** merge AL into bitmap at attach. That job belongs to the userspace tool:
+
+```bash
+# Userspace tool — NOT a kernel function
+drbdadm apply-al <resource>
+```
+
+What it does:
+```
+final_bitmap = bitmap_on_disk  |  AL_extents_converted_to_bits
+```
+1. Reads the AL transaction ring from metadata — reconstructs which extents were active.
+2. Converts each active 4 MB extent to a range of 4 KB bitmap bits (`extent × 1024` bits per extent).
+3. ORs those bits into the on-disk bitmap.
+4. Writes the merged bitmap back to metadata.
+5. Sets `MDF_AL_CLEAN = 1` in the superblock flags.
+
+The OR guarantees **no bits are lost**: if the bitmap was already set (from a previous resync), the bit stays set. If the AL has a bit the bitmap missed (the stale-bitmap case), the bit is added.
+
+### 10.3 Kernel refuses attach without `apply-al`
+
+At `drbd_nl.c:3065`:
+
+```c
+if (!(md->flags & MDF_AL_CLEAN)) {
+    drbd_err(device,
+        "Found unclean meta data. Did you 'drbdadm apply-al'?\n");
+    return ERR_MD_UNCLEAN;
+}
+```
+
+The kernel will not attach a disk that has a dirty AL (`MDF_AL_CLEAN = 0`). This forces the operator to run `apply-al` first, ensuring the bitmap is fully authoritative before the kernel reads it.
+
+After the gate passes, at `drbd_nl.c:3615`:
+
+```c
+drbd_bitmap_io(device, &drbd_bm_read,
+               "read from attaching", BM_LOCK_ALL, NULL);
+```
+
+The kernel simply reads the already-merged bitmap. No AL logic in the kernel attach path — `apply-al` did all the work.
+
+### 10.4 Two recovery granularities
+
+| Scenario | Bitmap source at reconnect | Granularity |
+|---|---|---|
+| **Crash** (no clean disconnect) | `bitmap_on_disk OR AL_extents` | 4 MB per AL extent — coarse |
+| **Clean disconnect** | `bitmap_on_disk` only (AL marked clean) | 4 KB per bit — fine |
+
+On a clean disconnect, DRBD flushes the bitmap, clears the AL (all in-flight writes complete), and sets `MDF_AL_CLEAN = 1`. At reconnect the fine-grained 4 KB bitmap drives resync — only truly OOS blocks are resynced.
+
+After a crash, the AL coarsens the resync to 4 MB extents. All blocks in each active AL extent are marked OOS even if only a fraction of them were actually in flight. This is safe (no data loss) but slightly over-resyncs.
+
+### 10.5 Special case: CRASHED_PRIMARY without MDF_AL_DISABLED
+
+At `drbd_nl.c:3702`:
+
+```c
+if (drbd_md_test_flag(device->ldev, MDF_PRIMARY_IND) &&
+    !drbd_md_test_flag(device->ldev, MDF_AL_DISABLED)) {
+    /* Node was primary and crashed with AL enabled →
+     * trigger full resync to be safe */
+    drbd_bmio_set_n_write(device);
+}
+```
+
+If `al-bypass` (`MDF_AL_DISABLED`) was set, the AL was not being used and every write was already being fully tracked in the bitmap — a full resync is not needed. But with the AL enabled, the bitmap may be stale beyond just the AL extents (e.g., from a previous partial resync). In the most conservative mode, DRBD forces a full resync.
+
+---
+
+## 11. Hands-On Exercises (3–4 hours)
 
 ### Exercise 1 (50 min): Read `drbd_actlog.c` end-to-end
 It is ~1000 lines. For every function, write its name and what it does. Pay special attention to:

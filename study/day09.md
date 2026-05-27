@@ -337,7 +337,97 @@ During `drbd_bm_write()`, `BM_LOCK_ALL` is set to prevent bit changes while page
 
 ---
 
-## 10. Hands-On Exercises (3–4 hours)
+## 10. When `drbd_bm_set_bits` Is Called at Sync Time
+
+`drbd_bm_set_bits()` is never called directly in hot paths — callers go through `drbd_set_out_of_sync()` (a macro in `drbd_actlog.c`) which converts a sector range to bit range and calls `drbd_bm_set_bits()` or `drbd_bm_set_many_bits()`. There are seven distinct call sites, each corresponding to a distinct reason a block becomes OOS:
+
+### 10.1 Resync write failed at SyncTarget
+
+**Location:** `drbd_sender.c` — `e_end_block()`
+
+**Trigger:** SyncTarget receives a resync block from SyncSource and writes it locally. If the local write fails (`EE_WAS_ERROR` flag set on the `drbd_peer_request`), the block cannot be cleared. `e_end_block()` calls `drbd_set_out_of_sync()` to keep the bit set (or re-mark it if it was prematurely cleared).
+
+```bash
+grep -n "EE_WAS_ERROR\|drbd_set_out_of_sync" drbd/drbd_sender.c | head -10
+# line ~192: drbd_set_out_of_sync() in e_end_block when EE_WAS_ERROR
+```
+
+### 10.2 Resync block unreadable at SyncSource
+
+**Location:** `drbd_sender.c` — `drbd_rs_failed_io()`
+
+**Trigger:** SyncSource cannot read the block from its local disk (read error during `w_make_resync_request`). `drbd_rs_failed_io()` marks the block OOS so the resync cursor skips it and records it for retry.
+
+### 10.3 Receive `P_OUT_OF_SYNC` (L_BEHIND)
+
+**Location:** `drbd_receiver.c:8822` — `receive_out_of_sync()`
+
+**Trigger:** SyncSource sends `P_OUT_OF_SYNC` to inform the SyncTarget that a range is out of sync. The SyncTarget calls `drbd_set_out_of_sync()` directly — no data is received, just the notification. Used when SyncSource skips blocks (e.g., verify mismatch) rather than sending data.
+
+```bash
+grep -n "receive_out_of_sync\b" drbd/drbd_receiver.c
+# line ~8822
+```
+
+### 10.4 Online Verify mismatch
+
+**Location:** `drbd_sender.c:2352` — `drbd_ov_out_of_sync_found()`
+
+**Trigger:** During online verify (`drbd-utils: drbdadm verify`), checksums of a block are compared between primary and secondary without stopping I/O. When checksums differ, `drbd_ov_out_of_sync_found()` marks the block OOS. The block will later be resynced.
+
+```bash
+grep -n "drbd_ov_out_of_sync_found\b" drbd/drbd_sender.c
+# line ~2352
+```
+
+### 10.5 `P_DATA` write on secondary with degraded disk
+
+**Location:** `drbd_receiver.c:3377` — `receive_Data()` + `drbd_receiver.c:1727` — `drbd_submit_peer_request()`
+
+**Trigger:** Secondary receives a `P_DATA` packet but its local disk state is `< D_INCONSISTENT`. `receive_Data()` sets the `EE_SET_OUT_OF_SYNC` flag on the `drbd_peer_request`. When the (failed or skipped) write completes, `drbd_submit_peer_request()` processes the flag and marks the block OOS via `drbd_set_out_of_sync()`.
+
+```bash
+grep -n "EE_SET_OUT_OF_SYNC" drbd/drbd_receiver.c
+# line ~3377 (set), ~1727 (processed)
+```
+
+### 10.6 Late `P_NEG_ACK`
+
+**Location:** `drbd_receiver.c:10780` — `got_NegAck()`
+
+**Trigger:** Primary receives a `P_NEG_ACK` (negative acknowledgment) from the secondary — the secondary's local write failed *after* accepting the data. The primary calls `drbd_set_out_of_sync()` to mark those blocks as OOS for that peer, so they will be queued for resync.
+
+```bash
+grep -n "got_NegAck\b" drbd/drbd_receiver.c
+# line ~10780
+```
+
+### 10.7 Crash recovery (AL → bitmap)
+
+**Location:** `drbd_actlog.c` — `drbd_al_apply_to_bm()`
+
+**Trigger:** Called by `drbdadm apply-al` (userspace) before kernel attach. Walks all occupied AL slots (extents that were "in flight" when the node crashed) and calls `drbd_bm_set_many_bits()` for each. Each 4 MB AL extent maps to 1024 bitmap bits (1024 × 4 KiB = 4 MiB). This is the coarsest call site — it sets bits in bulk.
+
+```bash
+grep -n "drbd_al_apply_to_bm\b" drbd/drbd_actlog.c
+grep -n -A 20 "^void drbd_al_apply_to_bm\b" drbd/drbd_actlog.c
+```
+
+### Summary table
+
+| # | Call site | File | Trigger |
+|---|---|---|---|
+| 1 | `e_end_block()` | `drbd_sender.c:192` | SyncTarget local write failure |
+| 2 | `drbd_rs_failed_io()` | `drbd_sender.c` | SyncSource local read failure |
+| 3 | `receive_out_of_sync()` | `drbd_receiver.c:8822` | P_OUT_OF_SYNC packet received |
+| 4 | `drbd_ov_out_of_sync_found()` | `drbd_sender.c:2352` | Online Verify checksum mismatch |
+| 5 | `drbd_submit_peer_request()` | `drbd_receiver.c:1727` | P_DATA on degraded-disk secondary |
+| 6 | `got_NegAck()` | `drbd_receiver.c:10780` | Late P_NEG_ACK from secondary |
+| 7 | `drbd_al_apply_to_bm()` | `drbd_actlog.c` | Crash recovery (AL → bitmap) |
+
+---
+
+## 11. Hands-On Exercises (3–4 hours)
 
 ### Exercise 1 (50 min): Read `drbd_bitmap.c` in full
 ~1800 lines. For every exported function (no `static`), write a one-sentence description. Identify all functions that do disk I/O.
