@@ -129,6 +129,60 @@ struct lc_element {
 };
 ```
 
+### 4.1 Why LRU? — design rationale (`lru_cache.h:23–118`)
+
+Each slot maps one 4MB extent. There are `al-extents` slots (default 1024). When all slots
+are occupied and a new extent is needed, one slot must be **evicted** — which requires a
+synchronous `REQ_FUA` disk transaction. LRU is the right eviction policy because:
+
+- **Locality of reference**: most workloads write repeatedly to a hot set of regions. LRU
+  keeps those regions warm so subsequent writes to the same extent are cache hits — no disk
+  transaction needed.
+- **Cache hit = fast path**: `lc_get()` finds the extent in the hash table, increments
+  `refcnt`, returns immediately. Zero disk I/O.
+- **Cache miss = slow path**: extent is new; evict the LRU slot; write a disk transaction
+  recording the old→new slot mapping; proceed. The disk transaction is the bottleneck.
+
+### 4.2 Three internal lists
+
+Each `lc_element` lives on exactly one list at all times:
+
+| List | Condition | Meaning |
+|---|---|---|
+| `in_use` | `refcnt > 0` | Extent has active writes — **cannot be evicted** |
+| `lru` | `refcnt == 0`, `lc_number != LC_FREE` | Extent cooled down — evictable, ordered by recency |
+| `free` | `lc_number == LC_FREE` | Slot never used — cheapest to allocate, no transaction needed |
+
+A hash table (`lc_slot`) maps extent number → `lc_element` for O(1) lookup.
+
+### 4.3 Lifecycle for a single write
+
+```
+Write to sector S:
+  extent_nr = S >> (AL_EXTENT_SHIFT - 9)   // S / 8192
+
+  lc_get(extent_nr):
+    CACHE HIT  → refcnt++, return element   ← no disk I/O (fast path)
+    CACHE MISS → pick slot from free list, or evict LRU element
+               → write disk transaction (old extent evicted, new extent recorded)
+               → return element
+
+  req->local_rq_state |= RQ_IN_ACT_LOG
+  Submit write to local disk + replicate to peer
+
+  Write completes (drbd_al_complete_io):
+    lc_put(element) → refcnt--
+    if refcnt == 0: move to lru list  ← extent "cools down", slot now evictable
+```
+
+### 4.4 Crash recovery
+
+On crash, every slot in both `in_use` and `lru` lists is still recorded in the on-disk AL
+transaction ring. `drbd_al_apply_to_bm()` reads all those slots on reconnect and sets the
+corresponding bits in the OOS bitmap. Only those extents are resynced — not the full
+device. The hard limit of `al-extents` slots directly bounds the worst-case resync scope:
+`1024 slots × 4MB = 4GB` maximum crash-recovery resync with default settings.
+
 ---
 
 ## 5. AL Reservation API — `drbd_al_begin_io_*()` Family
