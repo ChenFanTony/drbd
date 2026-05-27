@@ -427,7 +427,84 @@ grep -n -A 20 "^void drbd_al_apply_to_bm\b" drbd/drbd_actlog.c
 
 ---
 
-## 11. Hands-On Exercises (3–4 hours)
+## 11. When `drbd_bm_clear_bits` Is Called
+
+Bits are cleared via `drbd_set_in_sync()` — the symmetric counterpart to `drbd_set_out_of_sync()`. There are three triggers:
+
+### 11.1 Successful resync block (primary path)
+
+**Location:** `drbd_receiver.c` — `got_RSWriteAck()`
+
+The full flow across both sides:
+
+```
+SyncSource: drbd_bm_find_next() → finds set bit
+SyncSource: reads block from local disk
+SyncSource: sends P_RS_DATA_REPLY to SyncTarget
+
+SyncTarget: writes block locally → success
+SyncTarget: sends P_RS_WRITE_ACK back to SyncSource
+
+SyncSource: got_RSWriteAck() → drbd_set_in_sync() → drbd_bm_clear_bits()
+SyncTarget: also clears its own copy of the bit on successful write
+```
+
+Both sides maintain their own per-peer bitmap and clear the bit independently — SyncTarget on write success, SyncSource on ACK reception.
+
+```bash
+grep -n "got_RSWriteAck\b\|drbd_set_in_sync\b" drbd/drbd_receiver.c | head -10
+```
+
+### 11.2 Online Verify confirms match
+
+**Location:** `drbd_sender.c` — `drbd_ov_in_sync_found()`
+
+During online verify no data is transferred — only checksums are compared. When checksums match, `drbd_ov_in_sync_found()` calls `drbd_set_in_sync()` to clear the bit. This can clear bits that were set by `apply-al` even though the actual data was never different — the verify confirms they never diverged.
+
+```bash
+grep -n "drbd_ov_in_sync_found\b" drbd/drbd_sender.c
+```
+
+### 11.3 Resync finished
+
+**Location:** `drbd_worker.c` — `drbd_resync_finished()`
+
+When `bm_set` drops to 0 (all resync bits cleared by path 11.1 above), `drbd_resync_finished()` transitions the replication state from `L_SYNC_SOURCE`/`L_SYNC_TARGET` back to `L_ESTABLISHED` and writes the now-zero bitmap to disk via `drbd_bm_write()`.
+
+```bash
+grep -n "drbd_resync_finished\b" drbd/drbd_worker.c
+```
+
+### 11.4 Full bit lifecycle
+
+```
+Normal application I/O (connected, replication working):
+  bit stays 0 — never touched during successful writes
+
+Connection drops with writes in-flight:
+  tl_clear() → bit = 1  (block is OOS with this peer)
+
+Reconnect, resync runs:
+  SyncSource sends block → SyncTarget ACKs → bit = 0  (confirmed in-sync)
+
+Online Verify (no data transfer):
+  checksums match → bit = 0  (confirmed never diverged)
+  checksums differ → bit = 1  (OOS, queued for resync)
+```
+
+Bits are **never** cleared during application I/O. Clearing means "both sides have confirmed this block agrees" — only resync or verify can make that confirmation.
+
+### Summary table
+
+| Trigger | Call site | File |
+|---|---|---|
+| Resync block ACKed by SyncTarget | `got_RSWriteAck()` | `drbd_receiver.c` |
+| Online Verify checksums match | `drbd_ov_in_sync_found()` | `drbd_sender.c` |
+| Resync complete, all bits gone | `drbd_resync_finished()` | `drbd_worker.c` |
+
+---
+
+## 12. Hands-On Exercises (3–4 hours)
 
 ### Exercise 1 (50 min): Read `drbd_bitmap.c` in full
 ~1800 lines. For every exported function (no `static`), write a one-sentence description. Identify all functions that do disk I/O.
