@@ -120,9 +120,112 @@ struct drbd_path {
 };
 ```
 
-DRBD 9.2 supports **multiple paths** per connection (multipath TCP or bonding):
+`transport->paths` is a linked list — one `drbd_path` per configured IP address pair. DRBD 9 supports **multiple paths per connection**, giving both failover and load-balancing capabilities.
+
+### 4.1 Two transport modules for multi-path
+
+| Module | Name | Multi-path behaviour |
+|---|---|---|
+| `drbd_transport_tcp.ko` | `"tcp"` | Single active path; connect retry picks first available path |
+| `drbd_transport_lb-tcp.ko` | `"lb-tcp"` | Multiple active paths; failover or load-balance depending on config |
+
 ```bash
-grep -n "path_added\|path_removed\|list_for_each_entry.*path" drbd/drbd_transport.c drbd/drbd_transport_tcp.c | head -10
+grep -n "\.name\b" drbd/drbd_transport_tcp.c drbd/drbd_transport_lb-tcp.c | grep -v "#"
+```
+
+### 4.2 `lb-tcp` failover mode (`load-balance-paths no`, default)
+
+Multiple paths are configured but only **one is active** at a time. When the active path connects, `dtl_deactivate_other_paths()` parks the standby paths by closing their listeners. If the active path drops:
+
+```c
+// sk_state_change callback fires on socket close
+// → _dtl_path_established() rechecks DATA_STREAM + CONTROL_STREAM sockets
+// → TR_ESTABLISHED bit cleared → connected_paths--
+// → drbd_path_event() fires → connect_work queued
+// → dtl_connect_work() tries all paths, first to succeed becomes new active path
+```
+
+The DRBD connection **stays up** as long as at least one path reconnects. The upper layers (receiver/sender threads) see no disruption — only the underlying sockets change.
+
+### 4.3 `lb-tcp` load-balance mode (`load-balance-paths yes`)
+
+All configured paths are **active simultaneously**. Traffic is distributed across them using sequence numbers embedded in each packet:
+
+```c
+// drbd_transport_lb-tcp.c
+struct dtl_transport {
+    int connected_paths;                  // how many paths are currently up
+    wait_queue_head_t connected_paths_change;
+    ...
+};
+```
+
+Send side: each packet gets a sequence number and is dispatched round-robin across active path sockets.
+
+Receive side: `dtl_select_recv_flow()` reorders incoming packets from different paths using `recv_sequence` so the upper layer sees an ordered byte stream.
+
+```bash
+grep -n "DTL_LOAD_BALANCE\|recv_sequence\|send_sequence" drbd/drbd_transport_lb-tcp.c | head -15
+```
+
+### 4.4 Path failure detection
+
+Each path's health is tracked via `TR_ESTABLISHED` flag on `struct drbd_path`. The TCP socket's `sk_state_change` callback is overridden:
+
+```
+TCP socket closes (network failure, peer reset, etc.)
+  → sk_state_change callback fires
+  → dtl_path_established() called
+    → _dtl_path_established(): checks both DATA_STREAM and CONTROL_STREAM sockets
+    → if either is gone: clear TR_ESTABLISHED, connected_paths--
+    → drbd_path_event(transport, path)  ← notify state machine
+      → notify_path() → netlink event to userspace
+```
+
+`dtl_connect()` blocks until at least one path is established:
+
+```c
+// drbd_transport_lb-tcp.c:1443
+err = wait_event_interruptible(dtl_transport->connected_paths_change,
+                               dtl_transport->connected_paths > 0);
+```
+
+Connection is considered down only when `connected_paths == 0` — all paths have failed.
+
+### 4.5 Configuration
+
+```
+# drbd.conf — lb-tcp with two NICs, load-balance mode
+connection {
+  net {
+    transport "lb-tcp";
+    load-balance-paths yes;
+  }
+  path {
+    host nodeA address 192.168.1.1:7789;
+    host nodeB address 192.168.1.2:7789;
+  }
+  path {
+    host nodeA address 10.0.0.1:7789;   # second NIC / separate switch
+    host nodeB address 10.0.0.2:7789;
+  }
+}
+```
+
+For failover-only (resilience, no bandwidth aggregation), omit `load-balance-paths yes` or set it to `no`.
+
+### 4.6 Relevance to fencing and split-brain
+
+With a single path, one NIC failure can falsely trigger fencing: node A loses contact with node B and starts the fence-peer handler, even though node B is alive and healthy. With multiple paths:
+
+- `connected_paths > 0` means peer is still reachable via at least one interface
+- `connected_paths == 0` after all paths fail is much stronger evidence the peer is truly down
+- Reduces false-positive fencing triggered by single NIC or single switch failure
+
+This is why multi-path and quorum are often deployed together in production HA clusters: multi-path handles network redundancy, quorum handles the "are we allowed to proceed alone?" question.
+
+```bash
+grep -n "connected_paths\b" drbd/drbd_transport_lb-tcp.c | head -10
 ```
 
 ---
@@ -431,5 +534,7 @@ How many paths can a single DRBD connection have? What happens when a path fails
 ## Summary
 
 The transport abstraction (`drbd_transport_ops` vtable) decouples the DRBD protocol from the network implementation. `drbd_transport_tcp.c` implements this vtable using Linux kernel sockets: `dtt_connect()` establishes two TCP connections (data + meta), `dtt_send_page()` uses `kernel_sendpage()` for zero-copy sends, `dtt_recv_pages()` receives large payloads directly into page chain allocations, and `dtt_stream_ok()` provides health checks. DRBD's own ping mechanism (`P_PING` / `P_PING_ACK`) supplements TCP's keepalive with application-level timeout detection.
+
+Multi-path support is provided by `drbd_transport_lb-tcp.ko` (`"lb-tcp"` transport), which maintains a `connected_paths` counter across all configured IP address pairs. In failover mode only one path is active at a time; in load-balance mode all paths carry traffic simultaneously using per-packet sequence numbers. The DRBD connection stays up as long as `connected_paths > 0`, making single NIC or switch failure transparent to the replication layer and reducing false-positive fencing.
 
 **Next:** Day 17 — UUID system: generation, comparison, split-brain detection, and role in resync decisions.
