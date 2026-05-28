@@ -597,14 +597,44 @@ It is taken as `spin_lock_irq()` because `drbd_request_endio()` (which calls
 
 ## 10. INTERVAL_COMPLETED — Why Completed Intervals Stay in the Tree
 
-Application request intervals are **retained** in the tree even after completion
-(`INTERVAL_COMPLETED` set) for one reason: the primary needs to look up pending
-network replies (P_WRITE_ACK, P_RECV_ACK) that arrive after local completion.
-The `block_id` in the ACK packet is a pointer to the `drbd_request`; the tree
-keeps the request alive so the ACK handler can locate it.
+Application request intervals are **retained** in the tree even after local
+completion (`INTERVAL_COMPLETED` set) for one reason: the primary needs to look
+up the original `drbd_request` when the peer's ACK packet arrives.
 
-`drbd_find_conflict()` skips `INTERVAL_COMPLETED` intervals so they do not block
-new writes.
+### The `block_id` lookup mechanism
+
+When the primary sends a write to the peer, the `P_DATA` packet embeds the
+`drbd_request` pointer as `block_id`. When the peer replies with `P_WRITE_ACK`
+or `P_RECV_ACK`, that same `block_id` value comes back. The ACK handler uses it
+to locate the original request — so it can set `RQ_NET_DONE` and, under Protocol
+C, complete the `bio` back to the application via `complete_master_bio()`.
+
+The interval tree is the index that makes this safe. Without it, the request
+would be freed after local disk completion, leaving the ACK handler with a
+dangling pointer.
+
+### Lifecycle
+
+```
+Write completes on local disk:
+  set INTERVAL_BACKING_COMPLETED
+  set INTERVAL_COMPLETED             ← stays in tree; drbd_release_conflicts() fires
+  drbd_find_conflict() skips it      ← invisible to new writes (does not block them)
+
+Peer ACK arrives (P_WRITE_ACK / P_RECV_ACK):
+  block_id → locate drbd_request via tree lookup
+  set RQ_NET_DONE
+  drbd_remove_interval()             ← now truly removed from tree
+  complete_master_bio()              ← application sees write complete (Protocol C)
+  kref_put() → request freed
+```
+
+### Why `drbd_find_conflict()` skips `INTERVAL_COMPLETED`
+
+A completed interval's local disk I/O is done — it must not block new writes to
+the same range. Skipping `INTERVAL_COMPLETED` entries means these "ACK-pending"
+requests are invisible to conflict detection while still being findable by the
+ACK handler via direct `block_id` lookup.
 
 ---
 
