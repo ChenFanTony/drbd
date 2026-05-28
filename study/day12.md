@@ -418,6 +418,35 @@ latency on top of disk latency, harming performance with no correctness benefit.
 intervals — they are no longer a block for new submissions even though they may
 still be waiting for peer ACKs.
 
+#### Conflict detection is source-agnostic
+
+Both `INTERVAL_LOCAL_WRITE` (application write) and `INTERVAL_PEER_WRITE` (write
+received from peer) live in the same `device->requests` tree. `drbd_find_conflict()`
+scans that tree without filtering by type — it does not care whether the existing
+entry came from the local application or from the network.
+
+The rule is: **whoever is already in the tree proceeds; the newcomer is deferred**,
+regardless of origin.
+
+| Already in tree | Newcomer | Result |
+|---|---|---|
+| local write | local write | newcomer deferred |
+| peer write | local write | newcomer deferred |
+| local write | peer write | newcomer deferred |
+| peer write | peer write | newcomer deferred |
+
+"First in tree" means whoever grabbed `interval_lock` first, inserted without
+finding a conflict, and set `INTERVAL_SUBMITTED`. Source is irrelevant.
+
+This is correct because the ordering requirement is purely about the local disk
+seeing writes to the same range in a consistent sequence — a constraint that
+applies equally whether the in-flight write originated locally or from the network.
+
+The one exception is dual-primary mode: `drbd_peer_write_conflicts()` (section 8)
+explicitly looks for a `INTERVAL_LOCAL_WRITE` overlapping an incoming peer write.
+But the response there is **disconnect**, not deferral — DRBD cannot resolve a true
+concurrent local+peer write to the same sector and treats it as split-brain.
+
 ### 6.4 Resync: Skipping Blocks With Application Writes
 
 ```bash
