@@ -382,23 +382,41 @@ possible), it defers again.
 **Flow summary:**
 
 ```
-New write arrives
+New write B arrives, overlaps in-flight write A:
   → drbd_conflict_submit_write()
-    → drbd_find_conflict() → conflict found
-    → insert into tree WITHOUT INTERVAL_SUBMITTED
-    → return (request parked in tree)
+    → drbd_find_conflict() → conflict found (A)
+    → insert B into tree WITHOUT INTERVAL_SUBMITTED   ← parked, no AL/send/submit
+    → return immediately                              ← no sleep, no wait_event()
 
-Conflicting write's backing I/O completes
-  → set_bit(INTERVAL_BACKING_COMPLETED)
+Write A's local disk I/O completes (INTERVAL_BACKING_COMPLETED set):
   → drbd_release_conflicts()
-    → finds parked request, queues to submit_conflict wq
+    → finds B (INTERVAL_SUBMITTED not set), queues to submit_conflict wq
 
-submit_conflict workqueue fires
+submit_conflict workqueue fires:
   → drbd_do_submit_conflict()
-    → drbd_conflict_submit_write() for each queued write
+    → drbd_conflict_submit_write() for B
       → re-check drbd_find_conflict()
-      → no conflict now → set INTERVAL_SUBMITTED → drbd_send_and_submit()
+      → no conflict now  → set INTERVAL_SUBMITTED → drbd_send_and_submit()  ← B proceeds
+      → new conflict     → park again, wait for next drbd_release_conflicts()
 ```
+
+#### Why `INTERVAL_BACKING_COMPLETED`, not `INTERVAL_COMPLETED`?
+
+The unblock trigger is the conflicting write's **local disk I/O completing** — not
+its full completion (which, under Protocol C, requires a network ACK from the
+peer). This is intentional:
+
+The ordering requirement is purely about the **local disk** seeing writes in the
+correct sequence. Once write A's data is committed to the local backing device,
+write B can safely be submitted to that same device — the disk will see them in
+order. Whether A's peer has acknowledged is irrelevant to disk ordering.
+
+Waiting for the full Protocol C round-trip would unnecessarily stall B for network
+latency on top of disk latency, harming performance with no correctness benefit.
+
+`drbd_find_conflict()` implements this by skipping `INTERVAL_BACKING_COMPLETED`
+intervals — they are no longer a block for new submissions even though they may
+still be waiting for peer ACKs.
 
 ### 6.4 Resync: Skipping Blocks With Application Writes
 
