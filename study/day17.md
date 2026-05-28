@@ -344,7 +344,85 @@ This allows a new node connecting to a 3-node cluster to learn exactly which nod
 
 ---
 
-## 9. Hands-On Exercises (3–4 hours)
+## 9. Why UUIDs? Alternative Architectures for Data Lineage Tracking
+
+The bitmap and AL track **what** is out of sync. The UUID system answers **whether** to sync, **which direction**, and **whether the situation is safe** (split-brain or not). These are three separate questions the bitmap cannot answer:
+
+- **Who is authoritative?** Both sides may have OOS bits for each other — from an interrupted resync, or from two primaries writing divergent data. The bitmap looks identical in both cases.
+- **Were we ever in sync?** Two fresh nodes with empty bitmaps look the same as two fully-synced nodes, yet one needs a full initial sync and the other needs nothing.
+- **Split-brain detection?** Only UUID ancestry can distinguish "interrupted resync" from "independently written divergent data."
+
+The following alternatives exist architecturally; each has reasons why it is not suitable for a kernel block device replication layer.
+
+### 9.1 Vector Clocks
+
+*Used by: Riak, Amazon Dynamo, CouchDB.*
+
+Each node maintains one counter per peer. On write: increment own counter. On reconnect: compare vectors.
+
+```
+Node A: [A:5, B:3]   Node B: [A:3, B:7]
+→ A is ahead on A-writes, B is ahead on B-writes → concurrent writes detected
+```
+
+**Advantage over UUID**: Detects *partial* divergence — can tell exactly which writes from which node are missing, not just "someone is ahead."
+
+**Not suitable here**: Vector size grows O(N nodes). Each write must persist the vector — unacceptable overhead in a kernel block I/O path. Also, vectors give partial orders rather than a single "who wins" answer; conflict resolution becomes per-write rather than per-reconnect.
+
+### 9.2 Merkle Trees
+
+*Used by: Cassandra anti-entropy, ZFS, Git.*
+
+Hash the device recursively in chunks. On reconnect, compare tree hashes top-down to find diverging subtrees.
+
+**Advantage**: Would replace **both** UUID and bitmap with one structure — provides direction (who changed what) and content (which blocks differ) simultaneously.
+
+**Not suitable here**: Maintaining the Merkle tree incrementally is O(log N) per write with significant memory overhead. For a 1 TiB device at 4 KiB granularity the tree has 256 M leaf nodes. Too expensive on the hot I/O path in a kernel module.
+
+### 9.3 Sequential Term Numbers (Raft-style)
+
+*Used by: Raft consensus, etcd, Paxos.*
+
+Each Primary promotion increments a persistent integer counter. Higher term = more recent primary.
+
+**Advantage over UUID**: Ordered — term 7 is unambiguously newer than term 5. No history ring buffer needed.
+
+**Not suitable here**: Requires a coordinated, durable counter. In split-brain both nodes increment from the same base (both go 5 → 6), making terms ambiguous — the very scenario that needs to be detected. DRBD uses random UUIDs so that independently generated values are unique without coordination. The history ring also provides richer ancestry: not just "who is newer" but "are these lineages related at all?"
+
+### 9.4 Write-Ahead Log / LSN
+
+*Used by: PostgreSQL streaming replication, MySQL binlog.*
+
+Every write is appended to a WAL with a monotonic log sequence number. On reconnect: find the common LSN, replay forward.
+
+**Advantage**: Precise replay — exactly what changed and in what order.
+
+**Not suitable here**: A block device has no semantic understanding of writes; there are no transaction boundaries to replay. The WAL grows unbounded and needs compaction. This is the database replication model and does not map to a general-purpose block device.
+
+### 9.5 Physical Timestamps + Last-Write-Wins
+
+*Used by: Cassandra LWW, some eventually-consistent stores.*
+
+Each write gets a wall-clock timestamp; on conflict the higher timestamp wins silently.
+
+**Not suitable here**: Clock skew makes timestamps unreliable between nodes. More critically, silent last-write-wins means split-brain data loss is **invisible** — no detection, no alert. DRBD explicitly refuses to proceed on detected split-brain because silently picking a winner risks undetected data corruption.
+
+### 9.6 Why random UUID + history ring is the right fit
+
+| Requirement | How UUID satisfies it |
+|---|---|
+| No coordination on generation | Random bytes — no counter synchronisation needed |
+| Split-brain detection | UUID not in either node's history → definitely diverged |
+| Direction determination | UUID in peer's history → O(H) scan, H ≤ 32 entries |
+| Crash safety | Written to metadata before role change commits |
+| Zero hot-path overhead | UUID changes only on Primary promotion, never per write |
+| Kernel suitability | O(1) per write (push to ring), O(H) per reconnect |
+
+The key design insight: UUID generation is tied to **role transitions**, not to individual writes. This means the per-write cost is zero. The bitmap handles per-block content tracking; the UUID handles per-generation lineage tracking. Each mechanism does exactly one job.
+
+---
+
+## 10. Hands-On Exercises (3–4 hours)
 
 ### Exercise 1 (60 min): Read `drbd_uuid_compare()` completely
 ```bash
